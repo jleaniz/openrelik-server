@@ -591,5 +591,11 @@ def delete_workflow_template(
         print(f"Error: {e}")
 
 
-if __name__ == "__main__":
+def main():
     app()
+
+
+if __name__ == "__main__":
+    main()
+
+#

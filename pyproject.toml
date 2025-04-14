@@ -5,7 +5,14 @@ description = "Experimental forensic workflow system"
 authors = ["Johan Berggren <jberggren@gmail.com>"]
 license = "Apache 2.0"
 readme = "README.md"
-package-mode = false
+package-mode = true
+
+packages = [
+    { include = "src"},
+]
+
+[tool.poetry.scripts]
+openrelikctl = "src.admin:main"
 
 [tool.poetry.dependencies]
 python = "^3.12"
