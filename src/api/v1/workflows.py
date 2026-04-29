@@ -301,6 +301,11 @@ async def create_workflow(
 
     if request_body.template_id:
         from_template = get_workflow_template_from_db(db, request_body.template_id)
+        if not from_template:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Workflow template {request_body.template_id} not found",
+            )
         default_workflow_display_name = from_template.display_name
         spec_json = json.loads(from_template.spec_json)
         # Replace UUIDs with placeholder value for the template
