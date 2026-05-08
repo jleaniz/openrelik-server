@@ -11,6 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""AWS S3/SQS importer: polls SQS for object-create events and ingests files."""
+
 import json
 import logging
 import os
@@ -30,23 +32,27 @@ from lib import workflow_utils
 from lib.file_hashes import generate_hashes
 from lib.workflow_utils import TemplateNotFoundError
 
+# AWS connection.
 AWS_REGION = os.environ.get("AWS_REGION")
 SQS_QUEUE_URL = os.environ.get("AWS_SQS_QUEUE_URL")
-ROBOT_ACCOUNT_USER_ID = os.environ.get("ROBOT_ACCOUNT_USER_ID")
-HASH_SIZE_LIMIT = 10485760  # 10MB
 
-# Optional: after each successful file import, create and run a workflow
-# against the imported file using the configured template. Leave
-# AWS_IMPORT_TEMPLATE_ID unset to disable (importer just ingests files).
+# Import behavior.
+HASH_SIZE_LIMIT = 10485760  # 10MB
+ROBOT_ACCOUNT_USER_ID = os.environ.get("ROBOT_ACCOUNT_USER_ID")
+
+# Optional workflow auto-run: after each successful file import, create and
+# run a workflow against the imported file using the configured template.
+# Leave AWS_IMPORT_TEMPLATE_ID unset to disable (importer just ingests files).
 AWS_IMPORT_TEMPLATE_ID = os.environ.get("AWS_IMPORT_TEMPLATE_ID")
 AWS_IMPORT_TEMPLATE_PARAMS_RAW = os.environ.get("AWS_IMPORT_TEMPLATE_PARAMS", "")
 
-# SQS long-poll wait (seconds). Max allowed by SQS is 20.
-SQS_WAIT_TIME_SECONDS = 20
-# Max SQS messages per receive call (SQS cap is 10).
-SQS_MAX_MESSAGES = 10
+# SQS polling tunables.
 # Back-off when the receive call itself fails, to avoid busy-looping.
 RECEIVE_ERROR_BACKOFF_SECONDS = 5
+# Max SQS messages per receive call (SQS cap is 10).
+SQS_MAX_MESSAGES = 10
+# SQS long-poll wait (seconds). Max allowed by SQS is 20.
+SQS_WAIT_TIME_SECONDS = 20
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
