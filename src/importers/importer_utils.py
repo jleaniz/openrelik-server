@@ -21,7 +21,7 @@ from sqlalchemy.orm import Session
 
 from api.v1 import schemas
 from datastores.sql.crud.file import create_file_in_db
-from datastores.sql.crud.folder import create_root_folder_in_db
+from datastores.sql.crud.folder import create_root_folder_in_db, create_subfolder_in_db
 from datastores.sql.crud.user import get_user_from_db
 from datastores.sql.models import file
 from datastores.sql.models.folder import Folder
@@ -94,6 +94,47 @@ def get_or_create_root_folder(
 
     return create_root_folder_in_db(
         db,
+        schemas.FolderCreateRequest(display_name=display_name),
+        owner,
+    )
+
+
+def get_or_create_subfolder(
+    db: Session, parent_folder_id: int, display_name: str, user_id: int
+) -> Folder:
+    """Return the named subfolder under ``parent_folder_id``, creating it if missing.
+
+    Matches on (display_name, parent_id=parent_folder_id, owner=user_id) so
+    importers that mirror source layouts can idempotently land files under
+    existing paths across repeated events.
+
+    Args:
+        db: Database session.
+        parent_folder_id: The parent folder id to look under.
+        display_name: Folder name to look up or create.
+        user_id: Owner id (typically the robot user).
+
+    Returns:
+        The existing or newly created subfolder.
+    """
+    owner = get_user_from_db(db, user_id)
+    existing = (
+        db.query(Folder)
+        .join(UserRole, UserRole.folder_id == Folder.id)
+        .filter(
+            Folder.parent_id == parent_folder_id,
+            Folder.display_name == display_name,
+            UserRole.user_id == owner.id,
+            UserRole.role == Role.OWNER,
+        )
+        .first()
+    )
+    if existing:
+        return existing
+
+    return create_subfolder_in_db(
+        db,
+        parent_folder_id,
         schemas.FolderCreateRequest(display_name=display_name),
         owner,
     )

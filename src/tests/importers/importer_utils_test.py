@@ -15,7 +15,7 @@ import uuid
 
 import pytest
 
-from importers.file_utils import (
+from importers.importer_utils import (
     create_file_record,
     extract_file_info,
     get_or_create_root_folder,
@@ -63,8 +63,8 @@ def test_extract_file_info_non_integer_folder():
 
 def test_create_file_record(mocker):
     mock_db = mocker.MagicMock()
-    mock_get_user_from_db = mocker.patch("importers.file_utils.get_user_from_db")
-    mock_create_file_in_db = mocker.patch("importers.file_utils.create_file_in_db")
+    mock_get_user_from_db = mocker.patch("importers.importer_utils.get_user_from_db")
+    mock_create_file_in_db = mocker.patch("importers.importer_utils.create_file_in_db")
 
     create_file_record(
         mock_db, "testfile.txt", uuid.uuid4(), ".txt", folder_id=123, user_id=1
@@ -80,14 +80,14 @@ def test_get_or_create_root_folder_returns_existing(mocker):
     mock_owner = mocker.MagicMock()
     mock_owner.id = 1
     mocker.patch(
-        "importers.file_utils.get_user_from_db", return_value=mock_owner
+        "importers.importer_utils.get_user_from_db", return_value=mock_owner
     )
     existing_folder = mocker.MagicMock(name="existing_folder")
     # .query(Folder).join(...).filter(...).first() returns the folder.
     mock_db.query.return_value.join.return_value.filter.return_value.first.return_value = (
         existing_folder
     )
-    mock_create = mocker.patch("importers.file_utils.create_root_folder_in_db")
+    mock_create = mocker.patch("importers.importer_utils.create_root_folder_in_db")
 
     result = get_or_create_root_folder(mock_db, "mytestCase", user_id=1)
 
@@ -101,14 +101,14 @@ def test_get_or_create_root_folder_creates_when_missing(mocker):
     mock_owner = mocker.MagicMock()
     mock_owner.id = 1
     mocker.patch(
-        "importers.file_utils.get_user_from_db", return_value=mock_owner
+        "importers.importer_utils.get_user_from_db", return_value=mock_owner
     )
     mock_db.query.return_value.join.return_value.filter.return_value.first.return_value = (
         None
     )
     new_folder = mocker.MagicMock(name="new_folder")
     mock_create = mocker.patch(
-        "importers.file_utils.create_root_folder_in_db", return_value=new_folder
+        "importers.importer_utils.create_root_folder_in_db", return_value=new_folder
     )
 
     result = get_or_create_root_folder(mock_db, "mytestCase", user_id=1)

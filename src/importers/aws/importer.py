@@ -11,181 +11,55 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""AWS S3/SQS importer: polls SQS for object-create events and ingests files."""
+
 import json
 import logging
 import os
-import re
-import string
 import time
 import uuid
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict
 from urllib.parse import unquote_plus
 
 import boto3
-from openrelik_api_client.api_client import APIClient
-from openrelik_api_client.workflows import WorkflowsAPI
-from requests import HTTPError
+from sqlalchemy.orm import Session
 
 from datastores.sql import database
-from importers.file_utils import create_file_record, get_or_create_root_folder
+from datastores.sql.crud.user import get_user_from_db
+from datastores.sql.models.user import User
+from importers.importer_utils import (
+    create_file_record,
+    get_or_create_root_folder,
+    get_or_create_subfolder,
+)
+from lib import workflow_utils
 from lib.file_hashes import generate_hashes
+from lib.workflow_utils import TemplateNotFoundError
 
+# AWS connection.
 AWS_REGION = os.environ.get("AWS_REGION")
 SQS_QUEUE_URL = os.environ.get("AWS_SQS_QUEUE_URL")
-ROBOT_ACCOUNT_USER_ID = os.environ.get("ROBOT_ACCOUNT_USER_ID")
-HASH_SIZE_LIMIT = 10485760  # 10MB
 
-# Optional: after each successful file import, create and run a workflow
-# against the imported file using the configured template. Leave
-# AWS_IMPORT_TEMPLATE_ID unset to disable (importer just ingests files).
+# Import behavior.
+HASH_SIZE_LIMIT = 10485760  # 10MB
+ROBOT_ACCOUNT_USER_ID = os.environ.get("ROBOT_ACCOUNT_USER_ID")
+
+# Optional workflow auto-run: after each successful file import, create and
+# run a workflow against the imported file using the configured template.
+# Leave AWS_IMPORT_TEMPLATE_ID unset to disable (importer just ingests files).
 AWS_IMPORT_TEMPLATE_ID = os.environ.get("AWS_IMPORT_TEMPLATE_ID")
 AWS_IMPORT_TEMPLATE_PARAMS_RAW = os.environ.get("AWS_IMPORT_TEMPLATE_PARAMS", "")
-OPENRELIK_API_SERVER_URL = os.environ.get("OPENRELIK_API_SERVER_URL")
-OPENRELIK_API_KEY = os.environ.get("OPENRELIK_API_KEY")
 
-# How the importer interprets S3 keys. Both are operator-configurable.
-#
-# AWS_KEY_TEMPLATE describes the S3 key layout using `{placeholder}` segments
-# separated by literal `/` segments. `{case}` and `{filename}` are required;
-# any other placeholders (e.g. `{org}`) are captured and available for
-# rendering into the folder name.
-#
-# AWS_FOLDER_TEMPLATE describes the openrelik root-folder name, rendered from
-# the placeholders captured by the key template. Defaults to `{case}`, which
-# preserves single-tenant behavior. Set to e.g. `{org}-{case}` to keep
-# multi-tenant cases from colliding.
-DEFAULT_KEY_TEMPLATE = "users/{case}/data/{filename}"
-DEFAULT_FOLDER_TEMPLATE = "{case}"
-AWS_KEY_TEMPLATE = os.environ.get("AWS_KEY_TEMPLATE", DEFAULT_KEY_TEMPLATE)
-AWS_FOLDER_TEMPLATE = os.environ.get("AWS_FOLDER_TEMPLATE", DEFAULT_FOLDER_TEMPLATE)
-
-# SQS long-poll wait (seconds). Max allowed by SQS is 20.
-SQS_WAIT_TIME_SECONDS = 20
-# Max SQS messages per receive call (SQS cap is 10).
-SQS_MAX_MESSAGES = 10
+# SQS polling tunables.
 # Back-off when the receive call itself fails, to avoid busy-looping.
 RECEIVE_ERROR_BACKOFF_SECONDS = 5
+# Max SQS messages per receive call (SQS cap is 10).
+SQS_MAX_MESSAGES = 10
+# SQS long-poll wait (seconds). Max allowed by SQS is 20.
+SQS_WAIT_TIME_SECONDS = 20
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-
-_PLACEHOLDER_RE = re.compile(r"^\{([a-zA-Z_][a-zA-Z0-9_]*)\}$")
-
-
-class TemplateConfigError(ValueError):
-    """Raised when AWS_KEY_TEMPLATE / AWS_FOLDER_TEMPLATE are misconfigured."""
-
-
-def compile_key_template(template: str) -> Tuple[re.Pattern, List[str]]:
-    """Compile an AWS_KEY_TEMPLATE value into a matching regex.
-
-    Each `/`-delimited segment of the template must be either:
-      * a literal string (escaped), or
-      * exactly one placeholder of the form `{name}`.
-
-    The special `{filename}` placeholder is treated greedily (matches the rest
-    of the key, including any remaining `/`) and must therefore appear as the
-    final segment. All other placeholders match a single non-empty segment.
-
-    Args:
-        template: The raw template string.
-
-    Returns:
-        A tuple of (compiled_regex, ordered_placeholder_names).
-
-    Raises:
-        TemplateConfigError: If the template is malformed or does not capture
-            both `{case}` and `{filename}`.
-    """
-    if not template:
-        raise TemplateConfigError("AWS_KEY_TEMPLATE must not be empty.")
-
-    segments = template.split("/")
-    parts: List[str] = []
-    names: List[str] = []
-    for idx, segment in enumerate(segments):
-        if not segment:
-            raise TemplateConfigError(
-                f"AWS_KEY_TEMPLATE has an empty segment: {template!r}"
-            )
-        match = _PLACEHOLDER_RE.match(segment)
-        if match:
-            name = match.group(1)
-            if name in names:
-                raise TemplateConfigError(
-                    f"AWS_KEY_TEMPLATE placeholder {{{name}}} appears more than once."
-                )
-            names.append(name)
-            if name == "filename":
-                if idx != len(segments) - 1:
-                    raise TemplateConfigError(
-                        "{filename} must be the last segment of AWS_KEY_TEMPLATE."
-                    )
-                parts.append(r"(?P<filename>.+)")
-            else:
-                parts.append(rf"(?P<{name}>[^/]+)")
-        else:
-            # Reject partial-segment placeholders up front; they aren't supported.
-            if "{" in segment or "}" in segment:
-                raise TemplateConfigError(
-                    f"AWS_KEY_TEMPLATE segment {segment!r} mixes literal text and "
-                    "placeholders; each segment must be either a full literal or "
-                    "a standalone {placeholder}."
-                )
-            parts.append(re.escape(segment))
-
-    missing = {"case", "filename"} - set(names)
-    if missing:
-        raise TemplateConfigError(
-            "AWS_KEY_TEMPLATE must capture both {case} and {filename}; missing: "
-            + ", ".join(sorted(missing))
-        )
-
-    return re.compile("^" + "/".join(parts) + "$"), names
-
-
-def validate_folder_template(template: str, key_placeholders: List[str]) -> None:
-    """Validate AWS_FOLDER_TEMPLATE at startup.
-
-    Args:
-        template: The raw folder-template string.
-        key_placeholders: Placeholder names captured by AWS_KEY_TEMPLATE.
-
-    Raises:
-        TemplateConfigError: If the folder template references unknown
-            placeholders, references `{filename}`, or contains `/` (which
-            would imply nested subfolders, unsupported here).
-    """
-    if not template:
-        raise TemplateConfigError("AWS_FOLDER_TEMPLATE must not be empty.")
-    if "/" in template:
-        raise TemplateConfigError(
-            "AWS_FOLDER_TEMPLATE must not contain '/'; only flat root folders are supported."
-        )
-
-    referenced = {
-        field_name
-        for _, field_name, _, _ in string.Formatter().parse(template)
-        if field_name
-    }
-    if "filename" in referenced:
-        raise TemplateConfigError(
-            "AWS_FOLDER_TEMPLATE must not reference {filename}; "
-            "that would create one folder per file."
-        )
-    unknown = referenced - set(key_placeholders)
-    if unknown:
-        raise TemplateConfigError(
-            "AWS_FOLDER_TEMPLATE references placeholders not captured by "
-            "AWS_KEY_TEMPLATE: " + ", ".join(sorted(unknown))
-        )
-
-
-# Compile templates at import time so misconfiguration fails the container
-# startup loudly instead of silently skipping every message at runtime.
-KEY_PATTERN, KEY_PLACEHOLDERS = compile_key_template(AWS_KEY_TEMPLATE)
-validate_folder_template(AWS_FOLDER_TEMPLATE, KEY_PLACEHOLDERS)
 
 
 def _parse_template_params(raw: str) -> Dict[str, Any]:
@@ -195,83 +69,46 @@ def _parse_template_params(raw: str) -> Dict[str, Any]:
     try:
         parsed = json.loads(raw)
     except json.JSONDecodeError as e:
-        raise TemplateConfigError(
-            f"AWS_IMPORT_TEMPLATE_PARAMS is not valid JSON: {e}"
-        )
+        raise ValueError(f"AWS_IMPORT_TEMPLATE_PARAMS is not valid JSON: {e}")
     if not isinstance(parsed, dict):
-        raise TemplateConfigError(
-            "AWS_IMPORT_TEMPLATE_PARAMS must decode to a JSON object."
-        )
+        raise ValueError("AWS_IMPORT_TEMPLATE_PARAMS must decode to a JSON object.")
     return parsed
 
 
 AWS_IMPORT_TEMPLATE_PARAMS = _parse_template_params(AWS_IMPORT_TEMPLATE_PARAMS_RAW)
 
-# If workflow auto-run is enabled, we need the API coordinates up front so
-# misconfiguration is a loud startup failure, not a silent per-import one.
-if AWS_IMPORT_TEMPLATE_ID:
-    missing = [
-        name
-        for name, value in (
-            ("OPENRELIK_API_SERVER_URL", OPENRELIK_API_SERVER_URL),
-            ("OPENRELIK_API_KEY", OPENRELIK_API_KEY),
-        )
-        if not value
-    ]
-    if missing:
-        raise TemplateConfigError(
-            "AWS_IMPORT_TEMPLATE_ID is set but the API client is not fully "
-            "configured; missing: " + ", ".join(missing)
-        )
 
+def parse_key(object_key: str) -> tuple[list[str], str]:
+    """Split an S3 key into (folder path segments, filename).
 
-def parse_key(object_key: str) -> Dict[str, str]:
-    """Match ``object_key`` against the configured key template.
+    The key's directory structure is mirrored into the OpenRelik folder
+    tree. The key must contain at least one ``/`` — keys with no prefix
+    are rejected because the importer has no folder to place them under.
+
+    Examples:
+        ``root/abc/data/file.zip`` -> ``(["root", "abc", "data"], "file.zip")``
+        ``uploads/file.txt``         -> ``(["uploads"], "file.txt")``
 
     Args:
         object_key: The URL-decoded S3 object key.
 
     Returns:
-        A mapping of placeholder name to captured value, including at least
-        ``case`` and ``filename``.
+        A 2-tuple of (path_parts, filename).
 
     Raises:
-        ValueError: If the key does not match the template or any captured
-            value is empty.
+        ValueError: If the key has no ``/`` (no folder segment) or any
+            segment is empty.
     """
-    match = KEY_PATTERN.match(object_key)
-    if not match:
+    parts = object_key.split("/")
+    if len(parts) < 2:
         raise ValueError(
-            f"Key '{object_key}' does not match AWS_KEY_TEMPLATE "
-            f"{AWS_KEY_TEMPLATE!r}."
+            f"Key {object_key!r} has no folder prefix; expected at least "
+            "one '/' separator."
         )
-    captured = match.groupdict()
-    empty = [name for name, value in captured.items() if not value]
-    if empty:
-        raise ValueError(
-            f"Key '{object_key}' has empty captures for: {', '.join(sorted(empty))}"
-        )
-    return captured
-
-
-def render_folder_name(captured: Dict[str, str]) -> str:
-    """Render the configured folder template using captured placeholders.
-
-    Args:
-        captured: Placeholder values from ``parse_key``.
-
-    Returns:
-        The rendered folder display name.
-
-    Raises:
-        ValueError: If the rendered name is empty after stripping whitespace.
-    """
-    rendered = AWS_FOLDER_TEMPLATE.format(**captured).strip()
-    if not rendered:
-        raise ValueError(
-            "Rendered folder name is empty; check AWS_FOLDER_TEMPLATE."
-        )
-    return rendered
+    *path_parts, filename = parts
+    if not filename or any(not p for p in path_parts):
+        raise ValueError(f"Key {object_key!r} contains an empty path segment.")
+    return path_parts, filename
 
 
 def download_file_from_s3(
@@ -289,13 +126,20 @@ def download_file_from_s3(
     logger.info(f"Downloaded s3://{bucket_name}/{object_key} to {output_path}")
 
 
-def process_s3_record(s3_client: Any, record: Dict[str, Any], db: object) -> None:
+def process_s3_record(
+    s3_client: Any,
+    record: Dict[str, Any],
+    db: Session,
+    robot_user: User,
+) -> None:
     """Processes a single S3 event record from an SQS message.
 
     Args:
         s3_client: A boto3 S3 client.
         record: The S3 event record.
         db: Database session.
+        robot_user: The user under which imports and auto-run workflows are
+            attributed.
     """
     # S3 keys in notifications are URL-encoded, and '+' represents a space.
     raw_key = record["s3"]["object"]["key"]
@@ -311,19 +155,19 @@ def process_s3_record(s3_client: Any, record: Dict[str, Any], db: object) -> Non
         return
 
     try:
-        captured = parse_key(object_key)
-        folder_name = render_folder_name(captured)
+        path_parts, filename = parse_key(object_key)
     except ValueError as e:
         logger.error(f"Skipping object with unexpected key layout: {e}")
         return
 
-    filename = captured["filename"]
     _, file_extension = os.path.splitext(filename)
     file_uuid = uuid.uuid4()
     output_filename = f"{file_uuid.hex}{file_extension}"
 
-    # Resolve or auto-create the per-case root folder owned by the robot user.
-    folder = get_or_create_root_folder(db, folder_name, ROBOT_ACCOUNT_USER_ID)
+    # Mirror the S3 directory path into the robot user's folder tree.
+    folder = get_or_create_root_folder(db, path_parts[0], ROBOT_ACCOUNT_USER_ID)
+    for segment in path_parts[1:]:
+        folder = get_or_create_subfolder(db, folder.id, segment, ROBOT_ACCOUNT_USER_ID)
 
     output_path = os.path.join(folder.path, output_filename)
 
@@ -353,74 +197,54 @@ def process_s3_record(s3_client: Any, record: Dict[str, Any], db: object) -> Non
     if AWS_IMPORT_TEMPLATE_ID:
         try:
             _run_template_workflow(
-                _get_workflows_api(),
+                db,
                 folder_id=folder.id,
                 file_id=new_file_db.id,
+                user=robot_user,
             )
-        except HTTPError as e:
-            # The API client's bare HTTPError message is just "500 Server
-            # Error"; the response body usually has the real reason (e.g.
-            # "Workflow template 7 not found"). Surface that.
-            body = ""
-            if e.response is not None:
-                try:
-                    body = e.response.text
-                except Exception:
-                    body = "<unreadable response body>"
+        except TemplateNotFoundError as e:
             logger.error(
-                f"Workflow auto-run failed for file {new_file_db.id}: {e} "
-                f"(response body: {body!r})"
+                f"Workflow template {AWS_IMPORT_TEMPLATE_ID} not found for file {new_file_db.id}: {e}"
             )
         except Exception as e:
-            logger.exception(
-                f"Workflow auto-run failed for file {new_file_db.id}: {e}"
-            )
+            logger.exception(f"Workflow auto-run failed for file {new_file_db.id}: {e}")
 
     logger.info(f"Successfully processed s3://{bucket_name}/{object_key}")
 
 
-_workflows_api: Optional[WorkflowsAPI] = None
-
-
-def _get_workflows_api() -> WorkflowsAPI:
-    """Lazily construct the WorkflowsAPI client so it can be patched in tests."""
-    global _workflows_api
-    if _workflows_api is None:
-        api_client = APIClient(OPENRELIK_API_SERVER_URL, OPENRELIK_API_KEY)
-        _workflows_api = WorkflowsAPI(api_client)
-    return _workflows_api
-
-
 def _run_template_workflow(
-    workflows_api: WorkflowsAPI, folder_id: int, file_id: int
+    db: Session, *, folder_id: int, file_id: int, user: User
 ) -> None:
-    """Create a workflow from the configured template and run it.
+    """Create a workflow from the configured template and dispatch it, in-process.
 
     Args:
-        workflows_api: A configured WorkflowsAPI instance.
+        db: Database session.
         folder_id: The openrelik folder the imported file lives in. The
             workflow will be created as a subfolder underneath.
         file_id: The id of the newly imported file to run against.
+        user: The user under which the workflow is created and run.
     """
-    workflow_id = workflows_api.create_workflow(
+    workflow = workflow_utils.create_workflow_from_template(
+        db,
         folder_id=folder_id,
         file_ids=[file_id],
         template_id=int(AWS_IMPORT_TEMPLATE_ID),
         template_params=AWS_IMPORT_TEMPLATE_PARAMS,
+        user=user,
     )
-    if not workflow_id:
-        logger.error(
-            f"create_workflow returned no id for file {file_id}; skipping run."
-        )
-        return
-    workflows_api.run_workflow(folder_id=folder_id, workflow_id=workflow_id)
+    workflow_utils.run_workflow(
+        db,
+        workflow=workflow,
+        workflow_spec=json.loads(workflow.spec_json),
+        user=user,
+    )
     logger.info(
-        f"Started workflow {workflow_id} from template "
+        f"Started workflow {workflow.id} from template "
         f"{AWS_IMPORT_TEMPLATE_ID} for file {file_id}"
     )
 
 
-def _extract_s3_records(message: Dict[str, Any]) -> List[Dict[str, Any]]:
+def _extract_s3_records(message: Dict[str, Any]) -> list[Dict[str, Any]]:
     """Extracts S3 event records from an SQS message body.
 
     SQS can deliver S3 events directly or wrapped inside an SNS notification.
@@ -442,14 +266,15 @@ def _extract_s3_records(message: Dict[str, Any]) -> List[Dict[str, Any]]:
         return []
 
     return [
-        r
-        for r in records
-        if str(r.get("eventName", "")).startswith("ObjectCreated:")
+        r for r in records if str(r.get("eventName", "")).startswith("ObjectCreated:")
     ]
 
 
 def process_sqs_message(
-    s3_client: Any, message: Dict[str, Any], db: object
+    s3_client: Any,
+    message: Dict[str, Any],
+    db: Session,
+    robot_user: User,
 ) -> None:
     """Processes a single SQS message, which may contain multiple S3 records.
 
@@ -457,6 +282,8 @@ def process_sqs_message(
         s3_client: A boto3 S3 client.
         message: The SQS message dict.
         db: Database session.
+        robot_user: The user under which imports and auto-run workflows are
+            attributed.
     """
     records = _extract_s3_records(message)
     if not records:
@@ -464,7 +291,7 @@ def process_sqs_message(
         return
 
     for record in records:
-        process_s3_record(s3_client, record, db)
+        process_s3_record(s3_client, record, db, robot_user)
 
 
 def main() -> None:
@@ -481,6 +308,17 @@ def main() -> None:
         logger.error("AWS_SQS_QUEUE_URL environment variable is not set.")
         return
 
+    # Resolve the robot user once at startup. Bail loudly if it's missing so
+    # misconfiguration is obvious instead of silently tanking every message.
+    with database.SessionLocal() as db:
+        robot_user = get_user_from_db(db, int(ROBOT_ACCOUNT_USER_ID))
+    if robot_user is None:
+        logger.error(
+            f"ROBOT_ACCOUNT_USER_ID={ROBOT_ACCOUNT_USER_ID!r} does not match "
+            "any user in the database."
+        )
+        return
+
     sqs = boto3.client("sqs", region_name=AWS_REGION)
     s3 = boto3.client("s3", region_name=AWS_REGION)
 
@@ -489,11 +327,7 @@ def main() -> None:
         if AWS_IMPORT_TEMPLATE_ID
         else " Workflow auto-run disabled."
     )
-    logger.info(
-        f"Starting to poll SQS queue {SQS_QUEUE_URL} with key template "
-        f"{AWS_KEY_TEMPLATE!r} and folder template "
-        f"{AWS_FOLDER_TEMPLATE!r}.{template_note}"
-    )
+    logger.info(f"Starting to poll SQS queue {SQS_QUEUE_URL}.{template_note}")
 
     while True:
         try:
@@ -515,16 +349,14 @@ def main() -> None:
             receipt_handle = message.get("ReceiptHandle")
             try:
                 with database.SessionLocal() as db:
-                    process_sqs_message(s3, message, db)
+                    process_sqs_message(s3, message, db, robot_user)
             except Exception as e:
                 logger.exception(f"Error processing SQS message: {e}")
                 # Don't delete — let the queue redeliver after visibility timeout.
                 continue
 
             try:
-                sqs.delete_message(
-                    QueueUrl=SQS_QUEUE_URL, ReceiptHandle=receipt_handle
-                )
+                sqs.delete_message(QueueUrl=SQS_QUEUE_URL, ReceiptHandle=receipt_handle)
             except Exception as e:
                 logger.exception(f"Error deleting SQS message: {e}")
 
