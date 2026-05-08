@@ -36,7 +36,6 @@ from datastores.sql.crud.workflow import (
 )
 from datastores.sql.models.workflow import Task, Workflow
 
-
 # Redis URL and Celery app initialization.
 _redis_url = os.getenv("REDIS_URL")
 celery_app = Celery(broker=_redis_url, backend=_redis_url)
@@ -93,7 +92,8 @@ def get_task_signature(
     """
     task_uuid = task_data.get("uuid", uuid4().hex)
     task_config = {
-        option["name"]: option.get("value") for option in task_data.get("task_config", {})
+        option["name"]: option.get("value")
+        for option in task_data.get("task_config", {})
     }
 
     # Create a new DB task
@@ -189,7 +189,9 @@ def create_workflow_signature(
 
     elif task_data["type"] == "chord":
         header_tasks = [
-            create_workflow_signature(db, current_user, t, input_files, output_path, workflow)
+            create_workflow_signature(
+                db, current_user, t, input_files, output_path, workflow
+            )
             for t in task_data.get("tasks", [])
         ]
 
@@ -277,19 +279,33 @@ class TemplateNotFoundError(ValueError):
 def create_workflow_from_template(
     db: Session,
     *,
+    display_name: Optional[str] = None,
     folder_id: int,
     file_ids: list[int],
     template_id: Optional[int],
     template_params: Optional[dict],
     user: schemas.User,
-    display_name: Optional[str] = None,
 ) -> Workflow:
     """Create a Workflow (optionally from a template) and return it.
 
     Args:
-        display_name: Optional override for the workflow's (and results
-            subfolder's) display name. When None, falls back to the
-            template's display name, or "Untitled workflow" if no template.
+        db (Session): The database session.
+        display_name (Optional[str]): Optional override for the workflow's
+            (and results subfolder's) display name. When None, falls back to
+            the template's display name, or "Untitled workflow" if no
+            template.
+        folder_id (int): The ID of the parent folder that will hold the
+            workflow's results subfolder.
+        file_ids (list[int]): IDs of the files to associate with the workflow.
+        template_id (Optional[int]): Optional ID of a workflow template to
+            create the workflow from.
+        template_params (Optional[dict]): Optional dict of parameter values
+            to apply to the template's task configs. Keys should correspond
+            to the template's task config parameters.
+        user (schemas.User): The user creating the workflow.
+
+    Returns:
+        Workflow: The newly created workflow.
 
     Raises:
         TemplateNotFoundError: When ``template_id`` is provided but the
@@ -302,9 +318,7 @@ def create_workflow_from_template(
     if template_id:
         from_template = get_workflow_template_from_db(db, template_id)
         if not from_template:
-            raise TemplateNotFoundError(
-                f"Workflow template {template_id} not found"
-            )
+            raise TemplateNotFoundError(f"Workflow template {template_id} not found")
         default_workflow_display_name = from_template.display_name
         spec_json = json.loads(from_template.spec_json)
         # Replace the placeholder UUIDs seeded in the template with fresh ones
@@ -345,7 +359,7 @@ def run_workflow(
     Builds input-file dicts from ``workflow.files``, ensures the output
     directory exists, constructs the Celery canvas, and calls
     ``apply_async()``.
-    
+
     Returns:
         A Workflow instance representing the workflow that was run.
     """
