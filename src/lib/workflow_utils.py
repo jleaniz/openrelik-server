@@ -1,4 +1,4 @@
-# Copyright 2025-2026 Google LLC
+# Copyright 2026 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,12 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Workflow helpers reusable by the HTTP layer and in-process callers.
-
-These functions do not depend on FastAPI; they exist so that both
-``api.v1.workflows`` (HTTP) and, in the future, the bundled importers can
-create and run workflows without going through the REST API.
-"""
+"""Workflow helpers to create, manipulate or run workflows."""
 
 import json
 import os
@@ -42,6 +37,7 @@ from datastores.sql.crud.workflow import (
 from datastores.sql.models.workflow import Task, Workflow
 
 
+# Redis URL and Celery app initialization.
 _redis_url = os.getenv("REDIS_URL")
 celery_app = Celery(broker=_redis_url, backend=_redis_url)
 
@@ -66,7 +62,7 @@ def update_task_config_values(data: dict | list, parameters: dict) -> None:
                 item["value"] = parameters[param_name]
                 continue
 
-        for key, value in data.items():
+        for _, value in data.items():
             update_task_config_values(value, parameters)
 
     elif isinstance(data, list):
