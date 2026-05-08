@@ -1,4 +1,4 @@
-# Copyright 2025-2026 Google LLC
+# Copyright 2026 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,12 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Workflow helpers reusable by the HTTP layer and in-process callers.
-
-These functions do not depend on FastAPI; they exist so that both
-``api.v1.workflows`` (HTTP) and, in the future, the bundled importers can
-create and run workflows without going through the REST API.
-"""
+"""Workflow helpers to create, manipulate or run workflows."""
 
 import json
 import os
@@ -41,10 +36,7 @@ from datastores.sql.crud.workflow import (
 )
 from datastores.sql.models.workflow import Task, Workflow
 
-
-# Celery app shared by everything that dispatches workflow signatures.
-# Constructed at import time to match the behavior of the previous module-level
-# instance in ``api.v1.workflows``.
+# Redis URL and Celery app initialization.
 _redis_url = os.getenv("REDIS_URL")
 celery_app = Celery(broker=_redis_url, backend=_redis_url)
 
@@ -69,7 +61,7 @@ def update_task_config_values(data: dict | list, parameters: dict) -> None:
                 item["value"] = parameters[param_name]
                 continue
 
-        for key, value in data.items():
+        for _, value in data.items():
             update_task_config_values(value, parameters)
 
     elif isinstance(data, list):
@@ -100,7 +92,8 @@ def get_task_signature(
     """
     task_uuid = task_data.get("uuid", uuid4().hex)
     task_config = {
-        option["name"]: option.get("value") for option in task_data.get("task_config", {})
+        option["name"]: option.get("value")
+        for option in task_data.get("task_config", {})
     }
 
     # Create a new DB task
@@ -196,7 +189,9 @@ def create_workflow_signature(
 
     elif task_data["type"] == "chord":
         header_tasks = [
-            create_workflow_signature(db, current_user, t, input_files, output_path, workflow)
+            create_workflow_signature(
+                db, current_user, t, input_files, output_path, workflow
+            )
             for t in task_data.get("tasks", [])
         ]
 
@@ -284,6 +279,7 @@ class TemplateNotFoundError(ValueError):
 def create_workflow_from_template(
     db: Session,
     *,
+    display_name: Optional[str] = None,
     folder_id: int,
     file_ids: list[int],
     template_id: Optional[int],
@@ -291,12 +287,26 @@ def create_workflow_from_template(
     user: schemas.User,
     display_name: Optional[str] = None,
 ) -> Workflow:
-    """Create a workflow row (optionally from a template) and return it.
+    """Create a Workflow (optionally from a template) and return it.
 
-    Mirrors the behavior of the HTTP ``POST /folders/{folder_id}/workflows/``
-    route minus the request-parsing shell. No authorization is performed;
-    the caller is trusted (either an authenticated HTTP route that has
-    already checked access, or an in-process invoker such as an importer).
+    Args:
+        db (Session): The database session.
+        display_name (Optional[str]): Optional override for the workflow's
+            (and results subfolder's) display name. When None, falls back to
+            the template's display name, or "Untitled workflow" if no
+            template.
+        folder_id (int): The ID of the parent folder that will hold the
+            workflow's results subfolder.
+        file_ids (list[int]): IDs of the files to associate with the workflow.
+        template_id (Optional[int]): Optional ID of a workflow template to
+            create the workflow from.
+        template_params (Optional[dict]): Optional dict of parameter values
+            to apply to the template's task configs. Keys should correspond
+            to the template's task config parameters.
+        user (schemas.User): The user creating the workflow.
+
+    Returns:
+        Workflow: The newly created workflow.
 
     Args:
         display_name: Optional override for the workflow's (and results
@@ -314,9 +324,7 @@ def create_workflow_from_template(
     if template_id:
         from_template = get_workflow_template_from_db(db, template_id)
         if not from_template:
-            raise TemplateNotFoundError(
-                f"Workflow template {template_id} not found"
-            )
+            raise TemplateNotFoundError(f"Workflow template {template_id} not found")
         default_workflow_display_name = from_template.display_name
         spec_json = json.loads(from_template.spec_json)
         # Replace the placeholder UUIDs seeded in the template with fresh ones
@@ -352,11 +360,14 @@ def run_workflow(
     workflow_spec: dict,
     user: schemas.User,
 ) -> Workflow:
-    """Persist ``workflow_spec`` on ``workflow`` and dispatch it via Celery.
+    """Runs a workflow via Celery.
 
     Builds input-file dicts from ``workflow.files``, ensures the output
     directory exists, constructs the Celery canvas, and calls
-    ``apply_async()``. Returns the refreshed workflow row.
+    ``apply_async()``.
+
+    Returns:
+        A Workflow instance representing the workflow that was run.
     """
     workflow.spec_json = json.dumps(workflow_spec)
 
