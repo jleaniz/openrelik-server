@@ -1,4 +1,4 @@
-# Copyright 2025-2026 Google LLC
+# Copyright 2026 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,12 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Workflow helpers reusable by the HTTP layer and in-process callers.
-
-These functions do not depend on FastAPI; they exist so that both
-``api.v1.workflows`` (HTTP) and, in the future, the bundled importers can
-create and run workflows without going through the REST API.
-"""
+"""Workflow helpers to create, manipulate or run workflows."""
 
 import json
 import os
@@ -42,9 +37,7 @@ from datastores.sql.crud.workflow import (
 from datastores.sql.models.workflow import Task, Workflow
 
 
-# Celery app shared by everything that dispatches workflow signatures.
-# Constructed at import time to match the behavior of the previous module-level
-# instance in ``api.v1.workflows``.
+# Redis URL and Celery app initialization.
 _redis_url = os.getenv("REDIS_URL")
 celery_app = Celery(broker=_redis_url, backend=_redis_url)
 
@@ -69,7 +62,7 @@ def update_task_config_values(data: dict | list, parameters: dict) -> None:
                 item["value"] = parameters[param_name]
                 continue
 
-        for key, value in data.items():
+        for _, value in data.items():
             update_task_config_values(value, parameters)
 
     elif isinstance(data, list):
@@ -290,12 +283,7 @@ def create_workflow_from_template(
     template_params: Optional[dict],
     user: schemas.User,
 ) -> Workflow:
-    """Create a workflow row (optionally from a template) and return it.
-
-    Mirrors the behavior of the HTTP ``POST /folders/{folder_id}/workflows/``
-    route minus the request-parsing shell. No authorization is performed;
-    the caller is trusted (either an authenticated HTTP route that has
-    already checked access, or an in-process invoker such as an importer).
+    """Create a Workflow (optionally from a template) and return it.
 
     Raises:
         TemplateNotFoundError: When ``template_id`` is provided but the
@@ -344,11 +332,14 @@ def run_workflow(
     workflow_spec: dict,
     user: schemas.User,
 ) -> Workflow:
-    """Persist ``workflow_spec`` on ``workflow`` and dispatch it via Celery.
+    """Runs a workflow via Celery.
 
     Builds input-file dicts from ``workflow.files``, ensures the output
     directory exists, constructs the Celery canvas, and calls
-    ``apply_async()``. Returns the refreshed workflow row.
+    ``apply_async()``.
+    
+    Returns:
+        A Workflow instance representing the workflow that was run.
     """
     workflow.spec_json = json.dumps(workflow_spec)
 
