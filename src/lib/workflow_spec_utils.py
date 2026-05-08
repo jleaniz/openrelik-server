@@ -1,4 +1,4 @@
-# Copyright 2025-2026 Google LLC
+# Copyright 2026 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,12 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Pure-Python helpers that manipulate workflow spec dictionaries.
-
-Kept separate from ``lib.workflow_utils`` so modules in the CRUD layer can
-depend on spec-manipulation helpers without pulling in SQLAlchemy/Celery
-dependencies (which would create an import cycle).
-"""
+"""Helpers that manipulate workflow spec dictionaries."""
 
 from collections import defaultdict
 

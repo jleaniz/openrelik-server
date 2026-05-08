@@ -42,9 +42,6 @@ from datastores.sql.crud.workflow import (
 from datastores.sql.models.workflow import Task, Workflow
 
 
-# Celery app shared by everything that dispatches workflow signatures.
-# Constructed at import time to match the behavior of the previous module-level
-# instance in ``api.v1.workflows``.
 _redis_url = os.getenv("REDIS_URL")
 celery_app = Celery(broker=_redis_url, backend=_redis_url)
 
@@ -290,12 +287,7 @@ def create_workflow_from_template(
     template_params: Optional[dict],
     user: schemas.User,
 ) -> Workflow:
-    """Create a workflow row (optionally from a template) and return it.
-
-    Mirrors the behavior of the HTTP ``POST /folders/{folder_id}/workflows/``
-    route minus the request-parsing shell. No authorization is performed;
-    the caller is trusted (either an authenticated HTTP route that has
-    already checked access, or an in-process invoker such as an importer).
+    """Create a Workflow (optionally from a template) and return it.
 
     Raises:
         TemplateNotFoundError: When ``template_id`` is provided but the
@@ -344,11 +336,14 @@ def run_workflow(
     workflow_spec: dict,
     user: schemas.User,
 ) -> Workflow:
-    """Persist ``workflow_spec`` on ``workflow`` and dispatch it via Celery.
+    """Runs a workflow via Celery.
 
     Builds input-file dicts from ``workflow.files``, ensures the output
     directory exists, constructs the Celery canvas, and calls
-    ``apply_async()``. Returns the refreshed workflow row.
+    ``apply_async()``.
+    
+    Returns:
+        A Workflow instance representing the workflow that was run.
     """
     workflow.spec_json = json.dumps(workflow_spec)
 

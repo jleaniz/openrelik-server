@@ -13,8 +13,18 @@
 # limitations under the License.
 
 import pytest
+import json
+
+from unittest import mock
+
 from lib.workflow_spec_utils import add_unique_parameter_names
-from lib.workflow_utils import update_task_config_values
+from lib.workflow_utils import (
+    TemplateNotFoundError,
+    create_workflow_from_template,
+    replace_uuids,
+    run_workflow,
+    update_task_config_values,
+)
 
 
 def test_update_task_config_values():
@@ -97,22 +107,6 @@ def test_add_unique_parameter_names_no_name():
     assert "param_name" not in data["task_config"][0]
 
 
-# ---------------------------------------------------------------------------
-# Tests for replace_uuids, create_workflow_from_template, run_workflow.
-# ---------------------------------------------------------------------------
-
-import json
-from unittest import mock
-
-from lib import workflow_utils
-from lib.workflow_utils import (
-    TemplateNotFoundError,
-    create_workflow_from_template,
-    replace_uuids,
-    run_workflow,
-)
-
-
 def test_replace_uuids_generates_fresh_uuids():
     data = {"uuid": "OLD", "inner": {"uuid": "OLD"}, "list": [{"uuid": "OLD"}]}
     replace_uuids(data)
@@ -122,10 +116,6 @@ def test_replace_uuids_generates_fresh_uuids():
 
 
 def test_replace_uuids_with_explicit_value():
-    # Note: replace_uuids does not forward `replace_with` when it recurses
-    # (pre-existing behavior on main — not addressed in this refactor). So
-    # only the top-level "uuid" picks up the placeholder; nested uuids get
-    # fresh values instead. This test pins that current behavior.
     data = {"uuid": "OLD", "inner": {"uuid": "OLD"}}
     replace_uuids(data, replace_with="PLACEHOLDER")
     assert data["uuid"] == "PLACEHOLDER"
@@ -142,7 +132,10 @@ def test_create_workflow_from_template_with_template(mocker):
     mock_template.id = 7
     mock_template.display_name = "My Template"
     mock_template.spec_json = json.dumps(
-        {"uuid": "SEED", "workflow": {"task_config": [{"param_name": "p", "value": None}]}}
+        {
+            "uuid": "SEED",
+            "workflow": {"task_config": [{"param_name": "p", "value": None}]},
+        }
     )
     mock_folder = mock.Mock(id=99)
     mock_workflow = mock.Mock()
@@ -201,9 +194,7 @@ def test_create_workflow_from_template_without_template(mocker):
 
 
 def test_create_workflow_from_template_raises_when_template_missing(mocker):
-    mocker.patch(
-        "lib.workflow_utils.get_workflow_template_from_db", return_value=None
-    )
+    mocker.patch("lib.workflow_utils.get_workflow_template_from_db", return_value=None)
     with pytest.raises(TemplateNotFoundError):
         create_workflow_from_template(
             db=mock.Mock(),
