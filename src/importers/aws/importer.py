@@ -201,6 +201,7 @@ def process_s3_record(
                 db,
                 folder_id=folder.id,
                 file_id=new_file_db.id,
+                display_name=f"{filename}.workflow",
                 user=robot_user,
             )
         except TemplateNotFoundError as e:
@@ -221,7 +222,12 @@ def process_s3_record(
 
 
 def _run_template_workflow(
-    db: Session, *, folder_id: int, file_id: int, user: User
+    db: Session,
+    *,
+    folder_id: int,
+    file_id: int,
+    display_name: str,
+    user: User,
 ) -> None:
     """Create a workflow from the configured template and dispatch it, in-process.
 
@@ -230,6 +236,8 @@ def _run_template_workflow(
         folder_id: The openrelik folder the imported file lives in. The
             workflow will be created as a subfolder underneath.
         file_id: The id of the newly imported file to run against.
+        display_name: Display name for the new workflow and its results
+            subfolder.
         user: The user under which the workflow is created and run.
     """
     workflow = workflow_utils.create_workflow_from_template(
@@ -239,6 +247,7 @@ def _run_template_workflow(
         template_id=int(AWS_IMPORT_TEMPLATE_ID),
         template_params=AWS_IMPORT_TEMPLATE_PARAMS,
         user=user,
+        display_name=display_name,
     )
     workflow_utils.run_workflow(
         db,

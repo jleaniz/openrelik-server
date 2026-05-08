@@ -289,6 +289,7 @@ def create_workflow_from_template(
     template_id: Optional[int],
     template_params: Optional[dict],
     user: schemas.User,
+    display_name: Optional[str] = None,
 ) -> Workflow:
     """Create a workflow row (optionally from a template) and return it.
 
@@ -296,6 +297,11 @@ def create_workflow_from_template(
     route minus the request-parsing shell. No authorization is performed;
     the caller is trusted (either an authenticated HTTP route that has
     already checked access, or an in-process invoker such as an importer).
+
+    Args:
+        display_name: Optional override for the workflow's (and results
+            subfolder's) display name. When None, falls back to the
+            template's display name, or "Untitled workflow" if no template.
 
     Raises:
         TemplateNotFoundError: When ``template_id`` is provided but the
@@ -320,14 +326,16 @@ def create_workflow_from_template(
             update_task_config_values(spec_json, template_params)
         default_spec_json = json.dumps(spec_json)
 
+    workflow_display_name = display_name or default_workflow_display_name
+
     # Create a new folder to hold workflow results.
     new_folder = schemas.FolderCreateRequest(
-        display_name=default_workflow_display_name, parent_id=folder_id
+        display_name=workflow_display_name, parent_id=folder_id
     )
     new_workflow_folder = create_subfolder_in_db(db, folder_id, new_folder, user)
 
     new_workflow_db = schemas.Workflow(
-        display_name=default_workflow_display_name,
+        display_name=workflow_display_name,
         user_id=user.id,
         spec_json=default_spec_json,
         file_ids=file_ids,
