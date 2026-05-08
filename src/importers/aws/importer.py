@@ -27,7 +27,7 @@ from sqlalchemy.orm import Session
 from datastores.sql import database
 from datastores.sql.crud.user import get_user_from_db
 from datastores.sql.models.user import User
-from importers.file_utils import (
+from importers.importer_utils import (
     create_file_record,
     get_or_create_root_folder,
     get_or_create_subfolder,
@@ -69,13 +69,9 @@ def _parse_template_params(raw: str) -> Dict[str, Any]:
     try:
         parsed = json.loads(raw)
     except json.JSONDecodeError as e:
-        raise ValueError(
-            f"AWS_IMPORT_TEMPLATE_PARAMS is not valid JSON: {e}"
-        )
+        raise ValueError(f"AWS_IMPORT_TEMPLATE_PARAMS is not valid JSON: {e}")
     if not isinstance(parsed, dict):
-        raise ValueError(
-            "AWS_IMPORT_TEMPLATE_PARAMS must decode to a JSON object."
-        )
+        raise ValueError("AWS_IMPORT_TEMPLATE_PARAMS must decode to a JSON object.")
     return parsed
 
 
@@ -90,7 +86,7 @@ def parse_key(object_key: str) -> tuple[list[str], str]:
     are rejected because the importer has no folder to place them under.
 
     Examples:
-        ``users/abc/data/file.ize`` -> ``(["users", "abc", "data"], "file.ize")``
+        ``root/abc/data/file.zip`` -> ``(["root", "abc", "data"], "file.zip")``
         ``uploads/file.txt``         -> ``(["uploads"], "file.txt")``
 
     Args:
@@ -111,9 +107,7 @@ def parse_key(object_key: str) -> tuple[list[str], str]:
         )
     *path_parts, filename = parts
     if not filename or any(not p for p in path_parts):
-        raise ValueError(
-            f"Key {object_key!r} contains an empty path segment."
-        )
+        raise ValueError(f"Key {object_key!r} contains an empty path segment.")
     return path_parts, filename
 
 
@@ -173,9 +167,7 @@ def process_s3_record(
     # Mirror the S3 directory path into the robot user's folder tree.
     folder = get_or_create_root_folder(db, path_parts[0], ROBOT_ACCOUNT_USER_ID)
     for segment in path_parts[1:]:
-        folder = get_or_create_subfolder(
-            db, folder.id, segment, ROBOT_ACCOUNT_USER_ID
-        )
+        folder = get_or_create_subfolder(db, folder.id, segment, ROBOT_ACCOUNT_USER_ID)
 
     output_path = os.path.join(folder.path, output_filename)
 
@@ -212,12 +204,10 @@ def process_s3_record(
             )
         except TemplateNotFoundError as e:
             logger.error(
-                f"Workflow auto-run failed for file {new_file_db.id}: {e}"
+                f"Workflow template {AWS_IMPORT_TEMPLATE_ID} not found for file {new_file_db.id}: {e}"
             )
         except Exception as e:
-            logger.exception(
-                f"Workflow auto-run failed for file {new_file_db.id}: {e}"
-            )
+            logger.exception(f"Workflow auto-run failed for file {new_file_db.id}: {e}")
 
     logger.info(f"Successfully processed s3://{bucket_name}/{object_key}")
 
@@ -276,9 +266,7 @@ def _extract_s3_records(message: Dict[str, Any]) -> list[Dict[str, Any]]:
         return []
 
     return [
-        r
-        for r in records
-        if str(r.get("eventName", "")).startswith("ObjectCreated:")
+        r for r in records if str(r.get("eventName", "")).startswith("ObjectCreated:")
     ]
 
 
@@ -339,9 +327,7 @@ def main() -> None:
         if AWS_IMPORT_TEMPLATE_ID
         else " Workflow auto-run disabled."
     )
-    logger.info(
-        f"Starting to poll SQS queue {SQS_QUEUE_URL}.{template_note}"
-    )
+    logger.info(f"Starting to poll SQS queue {SQS_QUEUE_URL}.{template_note}")
 
     while True:
         try:
@@ -370,9 +356,7 @@ def main() -> None:
                 continue
 
             try:
-                sqs.delete_message(
-                    QueueUrl=SQS_QUEUE_URL, ReceiptHandle=receipt_handle
-                )
+                sqs.delete_message(QueueUrl=SQS_QUEUE_URL, ReceiptHandle=receipt_handle)
             except Exception as e:
                 logger.exception(f"Error deleting SQS message: {e}")
 
