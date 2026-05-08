@@ -14,11 +14,9 @@
 import json
 import logging
 import os
-import re
-import string
 import time
 import uuid
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict
 from urllib.parse import unquote_plus
 
 import boto3
@@ -43,22 +41,6 @@ HASH_SIZE_LIMIT = 10485760  # 10MB
 AWS_IMPORT_TEMPLATE_ID = os.environ.get("AWS_IMPORT_TEMPLATE_ID")
 AWS_IMPORT_TEMPLATE_PARAMS_RAW = os.environ.get("AWS_IMPORT_TEMPLATE_PARAMS", "")
 
-# How the importer interprets S3 keys. Both are operator-configurable.
-#
-# AWS_KEY_TEMPLATE describes the S3 key layout using `{placeholder}` segments
-# separated by literal `/` segments. `{case}` and `{filename}` are required;
-# any other placeholders (e.g. `{org}`) are captured and available for
-# rendering into the folder name.
-#
-# AWS_FOLDER_TEMPLATE describes the openrelik root-folder name, rendered from
-# the placeholders captured by the key template. Defaults to `{case}`, which
-# preserves single-tenant behavior. Set to e.g. `{org}-{case}` to keep
-# multi-tenant cases from colliding.
-DEFAULT_KEY_TEMPLATE = "users/{case}/data/{filename}"
-DEFAULT_FOLDER_TEMPLATE = "{case}"
-AWS_KEY_TEMPLATE = os.environ.get("AWS_KEY_TEMPLATE", DEFAULT_KEY_TEMPLATE)
-AWS_FOLDER_TEMPLATE = os.environ.get("AWS_FOLDER_TEMPLATE", DEFAULT_FOLDER_TEMPLATE)
-
 # SQS long-poll wait (seconds). Max allowed by SQS is 20.
 SQS_WAIT_TIME_SECONDS = 20
 # Max SQS messages per receive call (SQS cap is 10).
@@ -70,124 +52,6 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-_PLACEHOLDER_RE = re.compile(r"^\{([a-zA-Z_][a-zA-Z0-9_]*)\}$")
-
-
-class TemplateConfigError(ValueError):
-    """Raised when AWS_KEY_TEMPLATE / AWS_FOLDER_TEMPLATE are misconfigured."""
-
-
-def compile_key_template(template: str) -> Tuple[re.Pattern, List[str]]:
-    """Compile an AWS_KEY_TEMPLATE value into a matching regex.
-
-    Each `/`-delimited segment of the template must be either:
-      * a literal string (escaped), or
-      * exactly one placeholder of the form `{name}`.
-
-    The special `{filename}` placeholder is treated greedily (matches the rest
-    of the key, including any remaining `/`) and must therefore appear as the
-    final segment. All other placeholders match a single non-empty segment.
-
-    Args:
-        template: The raw template string.
-
-    Returns:
-        A tuple of (compiled_regex, ordered_placeholder_names).
-
-    Raises:
-        TemplateConfigError: If the template is malformed or does not capture
-            both `{case}` and `{filename}`.
-    """
-    if not template:
-        raise TemplateConfigError("AWS_KEY_TEMPLATE must not be empty.")
-
-    segments = template.split("/")
-    parts: List[str] = []
-    names: List[str] = []
-    for idx, segment in enumerate(segments):
-        if not segment:
-            raise TemplateConfigError(
-                f"AWS_KEY_TEMPLATE has an empty segment: {template!r}"
-            )
-        match = _PLACEHOLDER_RE.match(segment)
-        if match:
-            name = match.group(1)
-            if name in names:
-                raise TemplateConfigError(
-                    f"AWS_KEY_TEMPLATE placeholder {{{name}}} appears more than once."
-                )
-            names.append(name)
-            if name == "filename":
-                if idx != len(segments) - 1:
-                    raise TemplateConfigError(
-                        "{filename} must be the last segment of AWS_KEY_TEMPLATE."
-                    )
-                parts.append(r"(?P<filename>.+)")
-            else:
-                parts.append(rf"(?P<{name}>[^/]+)")
-        else:
-            # Reject partial-segment placeholders up front; they aren't supported.
-            if "{" in segment or "}" in segment:
-                raise TemplateConfigError(
-                    f"AWS_KEY_TEMPLATE segment {segment!r} mixes literal text and "
-                    "placeholders; each segment must be either a full literal or "
-                    "a standalone {placeholder}."
-                )
-            parts.append(re.escape(segment))
-
-    missing = {"case", "filename"} - set(names)
-    if missing:
-        raise TemplateConfigError(
-            "AWS_KEY_TEMPLATE must capture both {case} and {filename}; missing: "
-            + ", ".join(sorted(missing))
-        )
-
-    return re.compile("^" + "/".join(parts) + "$"), names
-
-
-def validate_folder_template(template: str, key_placeholders: List[str]) -> None:
-    """Validate AWS_FOLDER_TEMPLATE at startup.
-
-    Args:
-        template: The raw folder-template string.
-        key_placeholders: Placeholder names captured by AWS_KEY_TEMPLATE.
-
-    Raises:
-        TemplateConfigError: If the folder template references unknown
-            placeholders, references `{filename}`, or contains `/` (which
-            would imply nested subfolders, unsupported here).
-    """
-    if not template:
-        raise TemplateConfigError("AWS_FOLDER_TEMPLATE must not be empty.")
-    if "/" in template:
-        raise TemplateConfigError(
-            "AWS_FOLDER_TEMPLATE must not contain '/'; only flat root folders are supported."
-        )
-
-    referenced = {
-        field_name
-        for _, field_name, _, _ in string.Formatter().parse(template)
-        if field_name
-    }
-    if "filename" in referenced:
-        raise TemplateConfigError(
-            "AWS_FOLDER_TEMPLATE must not reference {filename}; "
-            "that would create one folder per file."
-        )
-    unknown = referenced - set(key_placeholders)
-    if unknown:
-        raise TemplateConfigError(
-            "AWS_FOLDER_TEMPLATE references placeholders not captured by "
-            "AWS_KEY_TEMPLATE: " + ", ".join(sorted(unknown))
-        )
-
-
-# Compile templates at import time so misconfiguration fails the container
-# startup loudly instead of silently skipping every message at runtime.
-KEY_PATTERN, KEY_PLACEHOLDERS = compile_key_template(AWS_KEY_TEMPLATE)
-validate_folder_template(AWS_FOLDER_TEMPLATE, KEY_PLACEHOLDERS)
-
-
 def _parse_template_params(raw: str) -> Dict[str, Any]:
     """Parse AWS_IMPORT_TEMPLATE_PARAMS at startup, or return {} if unset."""
     if not raw:
@@ -195,11 +59,11 @@ def _parse_template_params(raw: str) -> Dict[str, Any]:
     try:
         parsed = json.loads(raw)
     except json.JSONDecodeError as e:
-        raise TemplateConfigError(
+        raise ValueError(
             f"AWS_IMPORT_TEMPLATE_PARAMS is not valid JSON: {e}"
         )
     if not isinstance(parsed, dict):
-        raise TemplateConfigError(
+        raise ValueError(
             "AWS_IMPORT_TEMPLATE_PARAMS must decode to a JSON object."
         )
     return parsed
@@ -208,53 +72,35 @@ def _parse_template_params(raw: str) -> Dict[str, Any]:
 AWS_IMPORT_TEMPLATE_PARAMS = _parse_template_params(AWS_IMPORT_TEMPLATE_PARAMS_RAW)
 
 
-def parse_key(object_key: str) -> Dict[str, str]:
-    """Match ``object_key`` against the configured key template.
+def parse_key(object_key: str) -> tuple[str, str]:
+    """Extract ``(case, filename)`` from an S3 key.
+
+    Expected layout: ``users/<case>/data/<filename>``. The ``<filename>``
+    segment is greedy — nested subpaths under ``.../data/`` are preserved
+    in the returned filename (e.g. ``users/case1/data/sub/dir/file.txt``
+    returns filename ``sub/dir/file.txt``).
 
     Args:
         object_key: The URL-decoded S3 object key.
 
     Returns:
-        A mapping of placeholder name to captured value, including at least
-        ``case`` and ``filename``.
+        A 2-tuple of (case, filename).
 
     Raises:
-        ValueError: If the key does not match the template or any captured
-            value is empty.
+        ValueError: If the key does not match the expected layout.
     """
-    match = KEY_PATTERN.match(object_key)
-    if not match:
+    parts = object_key.split("/", 3)
+    if len(parts) < 4 or parts[0] != "users" or parts[2] != "data":
         raise ValueError(
-            f"Key '{object_key}' does not match AWS_KEY_TEMPLATE "
-            f"{AWS_KEY_TEMPLATE!r}."
+            f"Key {object_key!r} does not match expected layout "
+            "'users/<case>/data/<filename>'."
         )
-    captured = match.groupdict()
-    empty = [name for name, value in captured.items() if not value]
-    if empty:
+    case, filename = parts[1], parts[3]
+    if not case or not filename:
         raise ValueError(
-            f"Key '{object_key}' has empty captures for: {', '.join(sorted(empty))}"
+            f"Key {object_key!r} has an empty case or filename segment."
         )
-    return captured
-
-
-def render_folder_name(captured: Dict[str, str]) -> str:
-    """Render the configured folder template using captured placeholders.
-
-    Args:
-        captured: Placeholder values from ``parse_key``.
-
-    Returns:
-        The rendered folder display name.
-
-    Raises:
-        ValueError: If the rendered name is empty after stripping whitespace.
-    """
-    rendered = AWS_FOLDER_TEMPLATE.format(**captured).strip()
-    if not rendered:
-        raise ValueError(
-            "Rendered folder name is empty; check AWS_FOLDER_TEMPLATE."
-        )
-    return rendered
+    return case, filename
 
 
 def download_file_from_s3(
@@ -301,13 +147,12 @@ def process_s3_record(
         return
 
     try:
-        captured = parse_key(object_key)
-        folder_name = render_folder_name(captured)
+        case, filename = parse_key(object_key)
     except ValueError as e:
         logger.error(f"Skipping object with unexpected key layout: {e}")
         return
 
-    filename = captured["filename"]
+    folder_name = case
     _, file_extension = os.path.splitext(filename)
     file_uuid = uuid.uuid4()
     output_filename = f"{file_uuid.hex}{file_extension}"
@@ -392,7 +237,7 @@ def _run_template_workflow(
     )
 
 
-def _extract_s3_records(message: Dict[str, Any]) -> List[Dict[str, Any]]:
+def _extract_s3_records(message: Dict[str, Any]) -> list[Dict[str, Any]]:
     """Extracts S3 event records from an SQS message body.
 
     SQS can deliver S3 events directly or wrapped inside an SNS notification.
@@ -478,9 +323,7 @@ def main() -> None:
         else " Workflow auto-run disabled."
     )
     logger.info(
-        f"Starting to poll SQS queue {SQS_QUEUE_URL} with key template "
-        f"{AWS_KEY_TEMPLATE!r} and folder template "
-        f"{AWS_FOLDER_TEMPLATE!r}.{template_note}"
+        f"Starting to poll SQS queue {SQS_QUEUE_URL}.{template_note}"
     )
 
     while True:

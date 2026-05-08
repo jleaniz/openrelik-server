@@ -27,29 +27,21 @@ def importer_lib(mocker):
     mocker.patch.dict("sys.modules", {"boto3": mocker.MagicMock()})
 
     from importers.aws.importer import (
-        TemplateConfigError,
         _parse_template_params,
-        compile_key_template,
         download_file_from_s3,
         main,
         parse_key,
         process_s3_record,
         process_sqs_message,
-        render_folder_name,
-        validate_folder_template,
     )
 
     return {
-        "TemplateConfigError": TemplateConfigError,
         "_parse_template_params": _parse_template_params,
-        "compile_key_template": compile_key_template,
         "download_file_from_s3": download_file_from_s3,
         "main": main,
         "parse_key": parse_key,
         "process_s3_record": process_s3_record,
         "process_sqs_message": process_sqs_message,
-        "render_folder_name": render_folder_name,
-        "validate_folder_template": validate_folder_template,
     }
 
 
@@ -81,119 +73,6 @@ def _make_sqs_message(records, receipt_handle="rh-1", sns_wrapped=False):
 
 
 # ---------------------------------------------------------------------------
-# compile_key_template
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    "template,key,expected",
-    [
-        (
-            "users/{case}/data/{filename}",
-            "users/mytestCase/data/foo.ize",
-            {"case": "mytestCase", "filename": "foo.ize"},
-        ),
-        (
-            "{case}/{filename}",
-            "mytestCase/foo.ize",
-            {"case": "mytestCase", "filename": "foo.ize"},
-        ),
-        (
-            "tenants/{org}/cases/{case}/uploads/{filename}",
-            "tenants/acme/cases/mytestCase/uploads/foo.ize",
-            {"org": "acme", "case": "mytestCase", "filename": "foo.ize"},
-        ),
-        (
-            "collectors/{source}/{case}/{filename}",
-            "collectors/edr/mytestCase/foo.ize",
-            {"source": "edr", "case": "mytestCase", "filename": "foo.ize"},
-        ),
-        (
-            # {filename} is greedy — nested paths under the last segment are kept.
-            "users/{case}/data/{filename}",
-            "users/case1/data/sub/dir/file.txt",
-            {"case": "case1", "filename": "sub/dir/file.txt"},
-        ),
-    ],
-)
-def test_compile_key_template_matches(importer_lib, template, key, expected):
-    pattern, _ = importer_lib["compile_key_template"](template)
-    match = pattern.match(key)
-    assert match is not None
-    assert match.groupdict() == expected
-
-
-@pytest.mark.parametrize(
-    "template,bad_key",
-    [
-        ("users/{case}/data/{filename}", "uploads/case1/data/file.txt"),
-        ("users/{case}/data/{filename}", "users/case1/other/file.txt"),
-        ("users/{case}/data/{filename}", "users/case1/data"),
-        ("{case}/{filename}", ""),
-    ],
-)
-def test_compile_key_template_rejects_non_matching_keys(
-    importer_lib, template, bad_key
-):
-    pattern, _ = importer_lib["compile_key_template"](template)
-    assert pattern.match(bad_key) is None
-
-
-@pytest.mark.parametrize(
-    "bad_template",
-    [
-        "",  # empty
-        "users/{case}/{case}/{filename}",  # duplicate placeholder
-        "users/{case}/data",  # missing {filename}
-        "users/data/{filename}",  # missing {case}
-        "users/{filename}/{case}",  # {filename} not last
-        "users//{case}/{filename}",  # empty segment
-        "prefix-{case}/{filename}",  # partial-segment placeholder
-    ],
-)
-def test_compile_key_template_rejects_bad_templates(importer_lib, bad_template):
-    with pytest.raises(importer_lib["TemplateConfigError"]):
-        importer_lib["compile_key_template"](bad_template)
-
-
-# ---------------------------------------------------------------------------
-# validate_folder_template
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    "folder_template,key_placeholders",
-    [
-        ("{case}", ["case", "filename"]),
-        ("{org}-{case}", ["org", "case", "filename"]),
-        ("prefix-{case}-suffix", ["case", "filename"]),
-        ("{source}_{case}_v1", ["source", "case", "filename"]),
-    ],
-)
-def test_validate_folder_template_accepts(
-    importer_lib, folder_template, key_placeholders
-):
-    importer_lib["validate_folder_template"](folder_template, key_placeholders)
-
-
-@pytest.mark.parametrize(
-    "folder_template,key_placeholders",
-    [
-        ("", ["case", "filename"]),
-        ("{case}/{filename}", ["case", "filename"]),
-        ("{team}/{case}", ["case", "filename"]),
-        ("{team}-{case}", ["case", "filename"]),
-    ],
-    ids=["empty", "references_filename", "contains_slash", "unknown_placeholder"],
-)
-def test_validate_folder_template_rejects(
-    importer_lib, folder_template, key_placeholders
-):
-    with pytest.raises(importer_lib["TemplateConfigError"]):
-        importer_lib["validate_folder_template"](folder_template, key_placeholders)
-
-
-# ---------------------------------------------------------------------------
 # _parse_template_params
 # ---------------------------------------------------------------------------
 
@@ -210,23 +89,19 @@ def test_parse_template_params_valid_object(importer_lib):
 
 @pytest.mark.parametrize("bad_raw", ["not-json", "[1, 2, 3]", '"scalar"'])
 def test_parse_template_params_rejects_bad_values(importer_lib, bad_raw):
-    with pytest.raises(importer_lib["TemplateConfigError"]):
+    with pytest.raises(ValueError):
         importer_lib["_parse_template_params"](bad_raw)
 
 
 # ---------------------------------------------------------------------------
-# parse_key + render_folder_name (module-level default templates)
+# parse_key
 # ---------------------------------------------------------------------------
 
 
 def test_parse_key_valid(importer_lib):
-    captured = importer_lib["parse_key"](
+    assert importer_lib["parse_key"](
         "users/mytestCase/data/A_new_file_20261212.ize"
-    )
-    assert captured == {
-        "case": "mytestCase",
-        "filename": "A_new_file_20261212.ize",
-    }
+    ) == ("mytestCase", "A_new_file_20261212.ize")
 
 
 def test_parse_key_raises_on_bad_layout(importer_lib):
@@ -234,11 +109,16 @@ def test_parse_key_raises_on_bad_layout(importer_lib):
         importer_lib["parse_key"]("uploads/case1/data/file.txt")
 
 
-def test_render_folder_name_default_template(importer_lib):
-    assert (
-        importer_lib["render_folder_name"]({"case": "mytestCase", "filename": "x"})
-        == "mytestCase"
-    )
+def test_parse_key_greedy_filename(importer_lib):
+    """Filename segment keeps nested subpaths under .../data/."""
+    assert importer_lib["parse_key"](
+        "users/case1/data/sub/dir/file.txt"
+    ) == ("case1", "sub/dir/file.txt")
+
+
+def test_parse_key_rejects_empty_case(importer_lib):
+    with pytest.raises(ValueError):
+        importer_lib["parse_key"]("users//data/file.txt")
 
 
 # ---------------------------------------------------------------------------
@@ -522,31 +402,6 @@ def test_process_s3_record_logs_template_not_found(importer_lib, mocker, caplog)
     assert any(
         "Workflow template 9999 not found" in rec.message for rec in caplog.records
     ), "expected TemplateNotFoundError message to be logged"
-
-
-def test_process_s3_record_uses_custom_folder_template(importer_lib, mocker):
-    """Override AWS_FOLDER_TEMPLATE to verify the rendered folder name is used."""
-    patches = _patch_successful_dependencies(mocker)
-
-    # Patch the module-level template; parse_key still runs the default key
-    # template so we inject extra placeholders via a different key template.
-    from importers.aws import importer as aws_importer
-
-    key_pattern, _ = aws_importer.compile_key_template(
-        "tenants/{org}/cases/{case}/uploads/{filename}"
-    )
-    mocker.patch.object(aws_importer, "KEY_PATTERN", key_pattern)
-    mocker.patch.object(aws_importer, "AWS_FOLDER_TEMPLATE", "{org}-{case}")
-
-    importer_lib["process_s3_record"](
-        mocker.MagicMock(),
-        _make_s3_record(key="tenants/acme/cases/mytestCase/uploads/foo.ize"),
-        mocker.MagicMock(),
-        _make_robot_user(mocker),
-    )
-
-    args, _ = patches["get_or_create"].call_args
-    assert args[1] == "acme-mytestCase"
 
 
 # ---------------------------------------------------------------------------
