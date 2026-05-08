@@ -332,6 +332,7 @@ def test_process_s3_record_runs_workflow_when_template_id_set(importer_lib, mock
         template_id=7,
         template_params={"my_param_0": "value"},
         user=robot_user,
+        display_name="file.txt.workflow",
     )
     mock_run.assert_called_once_with(
         mock_db,
