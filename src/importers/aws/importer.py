@@ -194,6 +194,7 @@ def process_s3_record(
     # If a workflow template is configured, kick off a run against the newly
     # imported file. Failures here must not bubble up: the file is already
     # on disk and in the DB, so the user can re-run manually via the UI.
+    workflow_auto_run_ok = True
     if AWS_IMPORT_TEMPLATE_ID:
         try:
             _run_template_workflow(
@@ -206,10 +207,17 @@ def process_s3_record(
             logger.error(
                 f"Workflow template {AWS_IMPORT_TEMPLATE_ID} not found for file {new_file_db.id}: {e}"
             )
+            workflow_auto_run_ok = False
         except Exception as e:
             logger.exception(f"Workflow auto-run failed for file {new_file_db.id}: {e}")
+            workflow_auto_run_ok = False
 
-    logger.info(f"Successfully processed s3://{bucket_name}/{object_key}")
+    if workflow_auto_run_ok:
+        logger.info(f"Successfully processed s3://{bucket_name}/{object_key}")
+    else:
+        logger.warning(
+            f"Processed s3://{bucket_name}/{object_key} but workflow auto-run failed."
+        )
 
 
 def _run_template_workflow(
