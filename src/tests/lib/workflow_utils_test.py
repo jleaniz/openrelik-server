@@ -17,7 +17,6 @@ import json
 
 from unittest import mock
 
-from lib.workflow_spec_utils import add_unique_parameter_names
 from lib.workflow_utils import (
     TemplateNotFoundError,
     create_workflow_from_template,
@@ -69,42 +68,6 @@ def test_update_task_config_values_list():
 
     assert data[0]["task_config"][0]["value"] == "new"
     assert data[1]["task_config"][0]["value"] == "new"
-
-
-def test_add_unique_parameter_names():
-    """Test add_unique_parameter_names generates unique names."""
-    data = {
-        "task_config": [
-            {"name": "Parameter One"},
-            {"name": "Parameter One"},
-            {"name": "Parameter Two"},
-        ],
-        "sub_item": {
-            "task_config": [
-                {"name": "Parameter One"},
-            ]
-        },
-    }
-
-    add_unique_parameter_names(data)
-
-    assert data["task_config"][0]["param_name"] == "parameter_one_0"
-    assert data["task_config"][1]["param_name"] == "parameter_one_1"
-    assert data["task_config"][2]["param_name"] == "parameter_two_0"
-    assert data["sub_item"]["task_config"][0]["param_name"] == "parameter_one_2"
-
-
-def test_add_unique_parameter_names_no_name():
-    """Test add_unique_parameter_names ignores items without name."""
-    data = {
-        "task_config": [
-            {"value": "only value"},
-        ]
-    }
-
-    add_unique_parameter_names(data)
-
-    assert "param_name" not in data["task_config"][0]
 
 
 def test_replace_uuids_generates_fresh_uuids():
