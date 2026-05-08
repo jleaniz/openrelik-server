@@ -53,7 +53,7 @@ def _make_robot_user(mocker, user_id=42):
 
 def _make_s3_record(
     bucket="fcicollectors",
-    key="users/mytestCase/data/A_new_file_20261212.ize",
+    key="test/mytestCase/folder/filename.zip",
     size=100,
     event_name="ObjectCreated:Put",
 ):
@@ -72,19 +72,14 @@ def _make_sqs_message(records, receipt_handle="rh-1", sns_wrapped=False):
     return {"Body": json.dumps(body), "ReceiptHandle": receipt_handle}
 
 
-# ---------------------------------------------------------------------------
-# _parse_template_params
-# ---------------------------------------------------------------------------
-
-
 def test_parse_template_params_empty_returns_empty_dict(importer_lib):
     assert importer_lib["_parse_template_params"]("") == {}
 
 
 def test_parse_template_params_valid_object(importer_lib):
-    assert importer_lib["_parse_template_params"](
-        '{"param_1": "value"}'
-    ) == {"param_1": "value"}
+    assert importer_lib["_parse_template_params"]('{"param_1": "value"}') == {
+        "param_1": "value"
+    }
 
 
 @pytest.mark.parametrize("bad_raw", ["not-json", "[1, 2, 3]", '"scalar"'])
@@ -93,37 +88,29 @@ def test_parse_template_params_rejects_bad_values(importer_lib, bad_raw):
         importer_lib["_parse_template_params"](bad_raw)
 
 
-# ---------------------------------------------------------------------------
-# parse_key
-# ---------------------------------------------------------------------------
-
-
 def test_parse_key_valid(importer_lib):
     assert importer_lib["parse_key"](
-        "users/mytestCase/data/A_new_file_20261212.ize"
-    ) == ("mytestCase", "A_new_file_20261212.ize")
+        "test/mytestCase/folder/filename.zip"
+    ) == (["test", "mytestCase", "folder"], "filename.zip")
 
 
-def test_parse_key_raises_on_bad_layout(importer_lib):
+def test_parse_key_single_segment(importer_lib):
+    """A single-folder key mirrors to a single root folder with the file inside."""
+    assert importer_lib["parse_key"]("uploads/file.txt") == (
+        ["uploads"],
+        "file.txt",
+    )
+
+
+def test_parse_key_rejects_no_folder_prefix(importer_lib):
+    """A bare filename with no '/' is ambiguous and must be skipped."""
     with pytest.raises(ValueError):
-        importer_lib["parse_key"]("uploads/case1/data/file.txt")
+        importer_lib["parse_key"]("just-a-filename.txt")
 
 
-def test_parse_key_greedy_filename(importer_lib):
-    """Filename segment keeps nested subpaths under .../data/."""
-    assert importer_lib["parse_key"](
-        "users/case1/data/sub/dir/file.txt"
-    ) == ("case1", "sub/dir/file.txt")
-
-
-def test_parse_key_rejects_empty_case(importer_lib):
+def test_parse_key_rejects_empty_segment(importer_lib):
     with pytest.raises(ValueError):
         importer_lib["parse_key"]("users//data/file.txt")
-
-
-# ---------------------------------------------------------------------------
-# download_file_from_s3
-# ---------------------------------------------------------------------------
 
 
 def test_download_file_from_s3(importer_lib, mocker):
@@ -136,19 +123,21 @@ def test_download_file_from_s3(importer_lib, mocker):
     )
 
 
-# ---------------------------------------------------------------------------
-# process_s3_record
-# ---------------------------------------------------------------------------
-
-
 def _patch_successful_dependencies(mocker, folder_path="/folder/path", folder_id=7):
-    mock_get_or_create = mocker.patch(
+    mock_get_or_create_root = mocker.patch(
         "importers.aws.importer.get_or_create_root_folder"
     )
     mock_folder = mocker.MagicMock()
     mock_folder.path = folder_path
     mock_folder.id = folder_id
-    mock_get_or_create.return_value = mock_folder
+    mock_get_or_create_root.return_value = mock_folder
+
+    # Subfolder walk returns the same folder stub for every segment; tests only
+    # inspect the deepest folder's .id/.path and the sequence of call args.
+    mock_get_or_create_sub = mocker.patch(
+        "importers.aws.importer.get_or_create_subfolder"
+    )
+    mock_get_or_create_sub.return_value = mock_folder
 
     mock_download = mocker.patch("importers.aws.importer.download_file_from_s3")
     mock_create = mocker.patch("importers.aws.importer.create_file_record")
@@ -158,7 +147,8 @@ def _patch_successful_dependencies(mocker, folder_path="/folder/path", folder_id
     mock_hashes = mocker.patch("importers.aws.importer.generate_hashes")
 
     return {
-        "get_or_create": mock_get_or_create,
+        "get_or_create_root": mock_get_or_create_root,
+        "get_or_create_sub": mock_get_or_create_sub,
         "folder": mock_folder,
         "download": mock_download,
         "create": mock_create,
@@ -179,10 +169,15 @@ def test_process_s3_record_success(importer_lib, mocker):
         mocker.MagicMock(), record, mock_db, _make_robot_user(mocker)
     )
 
-    patches["get_or_create"].assert_called_once()
-    args, _ = patches["get_or_create"].call_args
-    assert args[0] is mock_db
-    assert args[1] == "mytestCase"
+    # Root folder is the first path segment; each remaining segment is a subfolder.
+    patches["get_or_create_root"].assert_called_once()
+    root_args, _ = patches["get_or_create_root"].call_args
+    assert root_args[0] is mock_db
+    assert root_args[1] == "users"
+
+    assert patches["get_or_create_sub"].call_count == 2
+    sub_segments = [c.args[2] for c in patches["get_or_create_sub"].call_args_list]
+    assert sub_segments == ["mytestCase", "data"]
 
     patches["download"].assert_called_once()
     download_args = patches["download"].call_args.args
@@ -202,8 +197,10 @@ def test_process_s3_record_url_encoded_key_is_decoded(importer_lib, mocker):
         mocker.MagicMock(), record, mocker.MagicMock(), _make_robot_user(mocker)
     )
 
-    args, _ = patches["get_or_create"].call_args
-    assert args[1] == "case one"
+    # Root is "users"; first subfolder is the decoded "case one".
+    assert patches["get_or_create_root"].call_args.args[1] == "users"
+    sub_segments = [c.args[2] for c in patches["get_or_create_sub"].call_args_list]
+    assert sub_segments == ["case one", "data"]
     # create_file_record(db, filename, file_uuid, file_extension, folder_id, user_id)
     assert patches["create"].call_args.args[1] == "my file name.txt"
 
@@ -224,13 +221,14 @@ def test_process_s3_record_skips_directory_marker(importer_lib, mocker):
 
 
 def test_process_s3_record_skips_bad_layout(importer_lib, mocker):
+    """A key with no '/' has no folder to land in; it must be skipped."""
     mock_get_or_create = mocker.patch(
         "importers.aws.importer.get_or_create_root_folder"
     )
 
     importer_lib["process_s3_record"](
         mocker.MagicMock(),
-        _make_s3_record(key="uploads/case1/data/file.txt"),
+        _make_s3_record(key="no-prefix-file.txt"),
         mocker.MagicMock(),
         _make_robot_user(mocker),
     )
@@ -256,9 +254,7 @@ def test_process_s3_record_skips_hashing_for_large_files(importer_lib, mocker):
     patches = _patch_successful_dependencies(mocker)
 
     # size > HASH_SIZE_LIMIT (10 MB)
-    record = _make_s3_record(
-        key="users/case1/data/big.bin", size=20 * 1024 * 1024
-    )
+    record = _make_s3_record(key="users/case1/data/big.bin", size=20 * 1024 * 1024)
     importer_lib["process_s3_record"](
         mocker.MagicMock(), record, mocker.MagicMock(), _make_robot_user(mocker)
     )
@@ -266,8 +262,8 @@ def test_process_s3_record_skips_hashing_for_large_files(importer_lib, mocker):
     patches["hashes"].assert_not_called()
 
 
-def test_process_s3_record_auto_creates_folder_for_new_case(importer_lib, mocker):
-    """The importer must not require the case folder to exist before the event."""
+def test_process_s3_record_auto_creates_folder_tree(importer_lib, mocker):
+    """The importer must mirror the full S3 directory path into the folder tree."""
     patches = _patch_successful_dependencies(mocker)
 
     importer_lib["process_s3_record"](
@@ -277,14 +273,13 @@ def test_process_s3_record_auto_creates_folder_for_new_case(importer_lib, mocker
         _make_robot_user(mocker),
     )
 
-    args, _ = patches["get_or_create"].call_args
-    assert args[1] == "brand-new-case"
+    assert patches["get_or_create_root"].call_args.args[1] == "users"
+    sub_segments = [c.args[2] for c in patches["get_or_create_sub"].call_args_list]
+    assert sub_segments == ["brand-new-case", "data"]
     patches["create"].assert_called_once()
 
 
-def test_process_s3_record_no_workflow_when_template_id_unset(
-    importer_lib, mocker
-):
+def test_process_s3_record_no_workflow_when_template_id_unset(importer_lib, mocker):
     """With AWS_IMPORT_TEMPLATE_ID unset (default), no workflow is created."""
     patches = _patch_successful_dependencies(mocker)
     mock_run = mocker.patch("importers.aws.importer._run_template_workflow")
@@ -301,9 +296,7 @@ def test_process_s3_record_no_workflow_when_template_id_unset(
     mock_run.assert_not_called()
 
 
-def test_process_s3_record_runs_workflow_when_template_id_set(
-    importer_lib, mocker
-):
+def test_process_s3_record_runs_workflow_when_template_id_set(importer_lib, mocker):
     patches = _patch_successful_dependencies(mocker)
 
     from importers.aws import importer as aws_importer
@@ -348,9 +341,7 @@ def test_process_s3_record_runs_workflow_when_template_id_set(
     )
 
 
-def test_process_s3_record_workflow_error_does_not_fail_import(
-    importer_lib, mocker
-):
+def test_process_s3_record_workflow_error_does_not_fail_import(importer_lib, mocker):
     """Failure inside create_workflow_from_template must not swallow the file import."""
     patches = _patch_successful_dependencies(mocker)
 
@@ -525,9 +516,7 @@ def _stub_main_dependencies(mocker, robot_user=None):
 
 def test_main_processes_message_and_deletes(importer_lib, mocker):
     mocker.patch("importers.aws.importer.ROBOT_ACCOUNT_USER_ID", "1")
-    mocker.patch(
-        "importers.aws.importer.SQS_QUEUE_URL", "https://sqs.example/queue"
-    )
+    mocker.patch("importers.aws.importer.SQS_QUEUE_URL", "https://sqs.example/queue")
 
     mock_sqs, _ = _stub_main_dependencies(mocker)
 
@@ -550,9 +539,7 @@ def test_main_processes_message_and_deletes(importer_lib, mocker):
 
 def test_main_processing_error_does_not_delete(importer_lib, mocker):
     mocker.patch("importers.aws.importer.ROBOT_ACCOUNT_USER_ID", "1")
-    mocker.patch(
-        "importers.aws.importer.SQS_QUEUE_URL", "https://sqs.example/queue"
-    )
+    mocker.patch("importers.aws.importer.SQS_QUEUE_URL", "https://sqs.example/queue")
 
     mock_sqs, _ = _stub_main_dependencies(mocker)
 
@@ -575,9 +562,7 @@ def test_main_processing_error_does_not_delete(importer_lib, mocker):
 
 def test_main_receive_error_retries(importer_lib, mocker):
     mocker.patch("importers.aws.importer.ROBOT_ACCOUNT_USER_ID", "1")
-    mocker.patch(
-        "importers.aws.importer.SQS_QUEUE_URL", "https://sqs.example/queue"
-    )
+    mocker.patch("importers.aws.importer.SQS_QUEUE_URL", "https://sqs.example/queue")
 
     mock_sqs, _ = _stub_main_dependencies(mocker)
     mock_sleep = mocker.patch("importers.aws.importer.time.sleep")
@@ -595,9 +580,7 @@ def test_main_receive_error_retries(importer_lib, mocker):
 
 def test_main_empty_receive_keeps_polling(importer_lib, mocker):
     mocker.patch("importers.aws.importer.ROBOT_ACCOUNT_USER_ID", "1")
-    mocker.patch(
-        "importers.aws.importer.SQS_QUEUE_URL", "https://sqs.example/queue"
-    )
+    mocker.patch("importers.aws.importer.SQS_QUEUE_URL", "https://sqs.example/queue")
 
     mock_sqs, _ = _stub_main_dependencies(mocker)
 
@@ -617,9 +600,7 @@ def test_main_empty_receive_keeps_polling(importer_lib, mocker):
 def test_main_no_robot_user_in_db(importer_lib, mocker):
     """ROBOT_ACCOUNT_USER_ID set but no matching user row -> abort before polling."""
     mocker.patch("importers.aws.importer.ROBOT_ACCOUNT_USER_ID", "99999")
-    mocker.patch(
-        "importers.aws.importer.SQS_QUEUE_URL", "https://sqs.example/queue"
-    )
+    mocker.patch("importers.aws.importer.SQS_QUEUE_URL", "https://sqs.example/queue")
 
     mock_boto = mocker.patch("importers.aws.importer.boto3.client")
     mocker.patch("importers.aws.importer.database")

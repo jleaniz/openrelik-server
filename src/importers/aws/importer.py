@@ -27,7 +27,11 @@ from sqlalchemy.orm import Session
 from datastores.sql import database
 from datastores.sql.crud.user import get_user_from_db
 from datastores.sql.models.user import User
-from importers.file_utils import create_file_record, get_or_create_root_folder
+from importers.file_utils import (
+    create_file_record,
+    get_or_create_root_folder,
+    get_or_create_subfolder,
+)
 from lib import workflow_utils
 from lib.file_hashes import generate_hashes
 from lib.workflow_utils import TemplateNotFoundError
@@ -78,35 +82,39 @@ def _parse_template_params(raw: str) -> Dict[str, Any]:
 AWS_IMPORT_TEMPLATE_PARAMS = _parse_template_params(AWS_IMPORT_TEMPLATE_PARAMS_RAW)
 
 
-def parse_key(object_key: str) -> tuple[str, str]:
-    """Extract ``(case, filename)`` from an S3 key.
+def parse_key(object_key: str) -> tuple[list[str], str]:
+    """Split an S3 key into (folder path segments, filename).
 
-    Expected layout: ``users/<case>/data/<filename>``. The ``<filename>``
-    segment is greedy — nested subpaths under ``.../data/`` are preserved
-    in the returned filename (e.g. ``users/case1/data/sub/dir/file.txt``
-    returns filename ``sub/dir/file.txt``).
+    The key's directory structure is mirrored into the OpenRelik folder
+    tree. The key must contain at least one ``/`` — keys with no prefix
+    are rejected because the importer has no folder to place them under.
+
+    Examples:
+        ``users/abc/data/file.ize`` -> ``(["users", "abc", "data"], "file.ize")``
+        ``uploads/file.txt``         -> ``(["uploads"], "file.txt")``
 
     Args:
         object_key: The URL-decoded S3 object key.
 
     Returns:
-        A 2-tuple of (case, filename).
+        A 2-tuple of (path_parts, filename).
 
     Raises:
-        ValueError: If the key does not match the expected layout.
+        ValueError: If the key has no ``/`` (no folder segment) or any
+            segment is empty.
     """
-    parts = object_key.split("/", 3)
-    if len(parts) < 4 or parts[0] != "users" or parts[2] != "data":
+    parts = object_key.split("/")
+    if len(parts) < 2:
         raise ValueError(
-            f"Key {object_key!r} does not match expected layout "
-            "'users/<case>/data/<filename>'."
+            f"Key {object_key!r} has no folder prefix; expected at least "
+            "one '/' separator."
         )
-    case, filename = parts[1], parts[3]
-    if not case or not filename:
+    *path_parts, filename = parts
+    if not filename or any(not p for p in path_parts):
         raise ValueError(
-            f"Key {object_key!r} has an empty case or filename segment."
+            f"Key {object_key!r} contains an empty path segment."
         )
-    return case, filename
+    return path_parts, filename
 
 
 def download_file_from_s3(
@@ -153,18 +161,21 @@ def process_s3_record(
         return
 
     try:
-        case, filename = parse_key(object_key)
+        path_parts, filename = parse_key(object_key)
     except ValueError as e:
         logger.error(f"Skipping object with unexpected key layout: {e}")
         return
 
-    folder_name = case
     _, file_extension = os.path.splitext(filename)
     file_uuid = uuid.uuid4()
     output_filename = f"{file_uuid.hex}{file_extension}"
 
-    # Resolve or auto-create the per-case root folder owned by the robot user.
-    folder = get_or_create_root_folder(db, folder_name, ROBOT_ACCOUNT_USER_ID)
+    # Mirror the S3 directory path into the robot user's folder tree.
+    folder = get_or_create_root_folder(db, path_parts[0], ROBOT_ACCOUNT_USER_ID)
+    for segment in path_parts[1:]:
+        folder = get_or_create_subfolder(
+            db, folder.id, segment, ROBOT_ACCOUNT_USER_ID
+        )
 
     output_path = os.path.join(folder.path, output_filename)
 
