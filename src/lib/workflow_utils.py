@@ -285,7 +285,6 @@ def create_workflow_from_template(
     template_id: Optional[int],
     template_params: Optional[dict],
     user: schemas.User,
-    display_name: Optional[str] = None,
 ) -> Workflow:
     """Create a Workflow (optionally from a template) and return it.
 
@@ -307,11 +306,6 @@ def create_workflow_from_template(
 
     Returns:
         Workflow: The newly created workflow.
-
-    Args:
-        display_name: Optional override for the workflow's (and results
-            subfolder's) display name. When None, falls back to the
-            template's display name, or "Untitled workflow" if no template.
 
     Raises:
         TemplateNotFoundError: When ``template_id`` is provided but the
