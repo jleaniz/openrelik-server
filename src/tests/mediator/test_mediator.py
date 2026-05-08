@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for the mediator's register_in_db guard in process_successful_task."""
+"""Tests for the mediator module."""
 
 import base64
 import json
