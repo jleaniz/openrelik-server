@@ -12,124 +12,85 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for the mediator's handling of the skip_file_creation flag."""
+"""Tests for the mediator's register_in_db guard in process_successful_task."""
 
 import base64
 import json
+from unittest import mock
 
 import pytest
 
 from mediator import mediator
 
 
-def _encode(result_dict):
-    """Encode a result dict the way workers do before publishing."""
-    return base64.b64encode(json.dumps(result_dict).encode("utf-8")).decode("utf-8")
-
-
-def _build_result(skip_file_creation=False, output_files=None, task_files=None):
-    return {
-        "output_files": output_files if output_files is not None else [{"uuid": "u1"}],
-        "workflow_id": "wf-1",
-        "task_files": task_files if task_files is not None else [],
-        "command": "cmd",
-        "meta": {},
+def _encoded_result(output_files, task_files=None):
+    """Base64-encode the dict the mediator expects from a Celery task."""
+    payload = {
+        "output_files": output_files,
+        "task_files": task_files or [],
         "file_reports": [],
-        "task_report": {},
-        "skip_file_creation": skip_file_creation,
+        "task_report": None,
+        "workflow_id": 1,
     }
+    return base64.b64encode(json.dumps(payload).encode("utf-8")).decode("utf-8")
 
 
 @pytest.fixture
-def mediator_mocks(mocker):
-    """Mock out all the side-effectful helpers the mediator reaches for."""
-    return {
-        "create_file_in_database": mocker.patch(
-            "mediator.mediator.create_file_in_database"
-        ),
-        "process_pending_file_reports": mocker.patch(
-            "mediator.mediator.process_pending_file_reports"
-        ),
-        "generate_hashes": mocker.patch("mediator.mediator.generate_hashes"),
-        "create_or_defer_file_report": mocker.patch(
-            "mediator.mediator.create_or_defer_file_report"
-        ),
-        "create_task_report_in_db": mocker.patch(
-            "mediator.mediator.create_task_report_in_db"
-        ),
-    }
+def fake_dependencies(monkeypatch):
+    """Stub the DB/hash/report helpers so the test doesn't need real infra."""
+    created = []
+
+    def _fake_create_file_in_database(db, file_data, result_dict, db_task):
+        created.append(file_data.get("uuid"))
+        fake = mock.Mock()
+        fake.id = len(created)
+        return fake
+
+    monkeypatch.setattr(mediator, "create_file_in_database", _fake_create_file_in_database)
+    monkeypatch.setattr(mediator, "process_pending_file_reports", mock.Mock())
+    monkeypatch.setattr(mediator, "generate_hashes", mock.Mock())
+    monkeypatch.setattr(mediator, "create_task_report_in_db", mock.Mock())
+
+    return created
 
 
-def _run_process_successful_task(mocker, result_dict):
-    celery_task = mocker.MagicMock()
-    celery_task.uuid = "task-uuid"
-    db_task = mocker.MagicMock()
-    db_task.id = 42
-    celery_app = mocker.MagicMock()
+def _run_process_successful_task(monkeypatch, encoded_result):
+    """Invoke process_successful_task with the given encoded Celery result."""
+    mock_async_result = mock.Mock()
+    mock_async_result.get.return_value = encoded_result
+    monkeypatch.setattr(mediator, "AsyncResult", lambda *a, **kw: mock_async_result)
 
-    mock_async_result = mocker.patch("mediator.mediator.AsyncResult")
-    mock_async_result.return_value.get.return_value = _encode(result_dict)
-
-    mediator.process_successful_task(mocker.MagicMock(), celery_task, db_task, celery_app)
-    return db_task
-
-
-def test_process_successful_task_creates_files_by_default(mocker, mediator_mocks):
-    result_dict = _build_result(
-        skip_file_creation=False,
-        output_files=[{"uuid": "u1"}, {"uuid": "u2"}],
+    celery_task = mock.Mock(uuid="task-uuid")
+    db_task = mock.Mock()
+    mediator.process_successful_task(
+        db=mock.Mock(), celery_task=celery_task, db_task=db_task, celery_app=mock.Mock()
     )
 
-    _run_process_successful_task(mocker, result_dict)
 
-    # Two output files -> two DB rows + two hash jobs.
-    assert mediator_mocks["create_file_in_database"].call_count == 2
-    assert mediator_mocks["generate_hashes"].call_count == 2
-    assert mediator_mocks["process_pending_file_reports"].call_count == 2
+def test_output_file_with_register_in_db_false_is_skipped(monkeypatch, fake_dependencies):
+    """Files with register_in_db=False must not be registered in the DB."""
+    output_files = [
+        {"uuid": "keep-me", "register_in_db": True},
+        {"uuid": "skip-me", "register_in_db": False},
+    ]
+    _run_process_successful_task(monkeypatch, _encoded_result(output_files))
 
-
-def test_process_successful_task_skips_output_file_db_creation(mocker, mediator_mocks):
-    result_dict = _build_result(
-        skip_file_creation=True,
-        output_files=[{"uuid": "u1"}, {"uuid": "u2"}],
-    )
-
-    _run_process_successful_task(mocker, result_dict)
-
-    mediator_mocks["create_file_in_database"].assert_not_called()
-    mediator_mocks["generate_hashes"].assert_not_called()
-    mediator_mocks["process_pending_file_reports"].assert_not_called()
+    assert fake_dependencies == ["keep-me"]
 
 
-def test_process_successful_task_still_creates_task_files_when_skipping(
-    mocker, mediator_mocks
-):
-    """skip_file_creation must only affect output_files, not task_files/reports."""
-    result_dict = _build_result(
-        skip_file_creation=True,
-        output_files=[{"uuid": "u1"}],
-        task_files=[{"uuid": "log1"}],
-    )
+def test_output_file_without_flag_defaults_to_registering(monkeypatch, fake_dependencies):
+    """Backward compat: missing flag => register (older workers keep working)."""
+    output_files = [{"uuid": "legacy-file"}]
+    _run_process_successful_task(monkeypatch, _encoded_result(output_files))
 
-    db_task = _run_process_successful_task(mocker, result_dict)
-
-    # output_files skipped, task_files still created (once).
-    assert mediator_mocks["create_file_in_database"].call_count == 1
-    # The one call was for the task (log) file, not the output file.
-    task_file_args = mediator_mocks["create_file_in_database"].call_args_list[0]
-    assert task_file_args.args[1] == {"uuid": "log1"}
-    # Hashing still runs for the log file.
-    assert mediator_mocks["generate_hashes"].call_count == 1
+    assert fake_dependencies == ["legacy-file"]
 
 
-def test_process_successful_task_missing_flag_defaults_to_creating(
-    mocker, mediator_mocks
-):
-    """Older workers may not set the key at all; default must be create-files."""
-    result_dict = _build_result(output_files=[{"uuid": "u1"}])
-    del result_dict["skip_file_creation"]
+def test_all_files_registered_when_all_flags_true(monkeypatch, fake_dependencies):
+    output_files = [
+        {"uuid": "a", "register_in_db": True},
+        {"uuid": "b", "register_in_db": True},
+    ]
+    _run_process_successful_task(monkeypatch, _encoded_result(output_files))
 
-    _run_process_successful_task(mocker, result_dict)
-
-    mediator_mocks["create_file_in_database"].assert_called_once()
-    mediator_mocks["generate_hashes"].assert_called_once()
+    assert fake_dependencies == ["a", "b"]
