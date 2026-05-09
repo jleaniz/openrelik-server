@@ -27,6 +27,7 @@ def importer_lib(mocker):
     mocker.patch.dict("sys.modules", {"boto3": mocker.MagicMock()})
 
     from importers.aws.importer import (
+        _parse_positive_int_env,
         _parse_template_params,
         download_file_from_s3,
         main,
@@ -36,6 +37,7 @@ def importer_lib(mocker):
     )
 
     return {
+        "_parse_positive_int_env": _parse_positive_int_env,
         "_parse_template_params": _parse_template_params,
         "download_file_from_s3": download_file_from_s3,
         "main": main,
@@ -88,10 +90,43 @@ def test_parse_template_params_rejects_bad_values(importer_lib, bad_raw):
         importer_lib["_parse_template_params"](bad_raw)
 
 
+def test_parse_template_params_json_error_preserves_cause(importer_lib):
+    """ValueError must chain from JSONDecodeError for debuggability."""
+    with pytest.raises(ValueError) as excinfo:
+        importer_lib["_parse_template_params"]("not-json")
+    assert isinstance(excinfo.value.__cause__, json.JSONDecodeError)
+
+
+@pytest.mark.parametrize("raw", [None, ""])
+def test_parse_positive_int_env_none_or_empty_returns_none(importer_lib, raw):
+    """Unset or empty env is the canonical "disabled" signal and must not raise."""
+    assert importer_lib["_parse_positive_int_env"]("MY_VAR", raw) is None
+
+
+@pytest.mark.parametrize("raw,expected", [("1", 1), ("42", 42), ("99999", 99999)])
+def test_parse_positive_int_env_valid(importer_lib, raw, expected):
+    assert importer_lib["_parse_positive_int_env"]("MY_VAR", raw) == expected
+
+
+@pytest.mark.parametrize("raw", ["abc", "1.5", " ", "1 2", "0x1"])
+def test_parse_positive_int_env_rejects_non_integers(importer_lib, raw):
+    """Non-integer values must fail fast at startup, not per-message."""
+    with pytest.raises(ValueError, match="MY_VAR"):
+        importer_lib["_parse_positive_int_env"]("MY_VAR", raw)
+
+
+@pytest.mark.parametrize("raw", ["0", "-1", "-99"])
+def test_parse_positive_int_env_rejects_non_positive(importer_lib, raw):
+    """0 and negatives are invalid; positive-only is part of the contract."""
+    with pytest.raises(ValueError, match="MY_VAR"):
+        importer_lib["_parse_positive_int_env"]("MY_VAR", raw)
+
+
 def test_parse_key_valid(importer_lib):
-    assert importer_lib["parse_key"](
-        "test/mytestCase/folder/filename.zip"
-    ) == (["test", "mytestCase", "folder"], "filename.zip")
+    assert importer_lib["parse_key"]("test/mytestCase/folder/filename.zip") == (
+        ["test", "mytestCase", "folder"],
+        "filename.zip",
+    )
 
 
 def test_parse_key_single_segment(importer_lib):
@@ -301,7 +336,7 @@ def test_process_s3_record_runs_workflow_when_template_id_set(importer_lib, mock
 
     from importers.aws import importer as aws_importer
 
-    mocker.patch.object(aws_importer, "AWS_IMPORT_TEMPLATE_ID", "7")
+    mocker.patch.object(aws_importer, "AWS_IMPORT_TEMPLATE_ID", 7)
     mocker.patch.object(
         aws_importer, "AWS_IMPORT_TEMPLATE_PARAMS", {"my_param_0": "value"}
     )
@@ -348,7 +383,7 @@ def test_process_s3_record_workflow_error_does_not_fail_import(importer_lib, moc
 
     from importers.aws import importer as aws_importer
 
-    mocker.patch.object(aws_importer, "AWS_IMPORT_TEMPLATE_ID", "7")
+    mocker.patch.object(aws_importer, "AWS_IMPORT_TEMPLATE_ID", 7)
     mocker.patch(
         "lib.workflow_utils.create_workflow_from_template",
         side_effect=Exception("db down"),
@@ -374,7 +409,7 @@ def test_process_s3_record_logs_template_not_found(importer_lib, mocker, caplog)
 
     from importers.aws import importer as aws_importer
 
-    mocker.patch.object(aws_importer, "AWS_IMPORT_TEMPLATE_ID", "9999")
+    mocker.patch.object(aws_importer, "AWS_IMPORT_TEMPLATE_ID", 9999)
     mocker.patch(
         "lib.workflow_utils.create_workflow_from_template",
         side_effect=TemplateNotFoundError("Workflow template 9999 not found"),
@@ -490,7 +525,7 @@ def test_main_no_robot_user(importer_lib, mocker):
 
 
 def test_main_no_queue_url(importer_lib, mocker):
-    mocker.patch("importers.aws.importer.ROBOT_ACCOUNT_USER_ID", "1")
+    mocker.patch("importers.aws.importer.ROBOT_ACCOUNT_USER_ID", 1)
     mocker.patch("importers.aws.importer.SQS_QUEUE_URL", None)
     mock_boto = mocker.patch("importers.aws.importer.boto3.client")
 
@@ -516,7 +551,7 @@ def _stub_main_dependencies(mocker, robot_user=None):
 
 
 def test_main_processes_message_and_deletes(importer_lib, mocker):
-    mocker.patch("importers.aws.importer.ROBOT_ACCOUNT_USER_ID", "1")
+    mocker.patch("importers.aws.importer.ROBOT_ACCOUNT_USER_ID", 1)
     mocker.patch("importers.aws.importer.SQS_QUEUE_URL", "https://sqs.example/queue")
 
     mock_sqs, _ = _stub_main_dependencies(mocker)
@@ -539,7 +574,7 @@ def test_main_processes_message_and_deletes(importer_lib, mocker):
 
 
 def test_main_processing_error_does_not_delete(importer_lib, mocker):
-    mocker.patch("importers.aws.importer.ROBOT_ACCOUNT_USER_ID", "1")
+    mocker.patch("importers.aws.importer.ROBOT_ACCOUNT_USER_ID", 1)
     mocker.patch("importers.aws.importer.SQS_QUEUE_URL", "https://sqs.example/queue")
 
     mock_sqs, _ = _stub_main_dependencies(mocker)
@@ -562,7 +597,7 @@ def test_main_processing_error_does_not_delete(importer_lib, mocker):
 
 
 def test_main_receive_error_retries(importer_lib, mocker):
-    mocker.patch("importers.aws.importer.ROBOT_ACCOUNT_USER_ID", "1")
+    mocker.patch("importers.aws.importer.ROBOT_ACCOUNT_USER_ID", 1)
     mocker.patch("importers.aws.importer.SQS_QUEUE_URL", "https://sqs.example/queue")
 
     mock_sqs, _ = _stub_main_dependencies(mocker)
@@ -580,7 +615,7 @@ def test_main_receive_error_retries(importer_lib, mocker):
 
 
 def test_main_empty_receive_keeps_polling(importer_lib, mocker):
-    mocker.patch("importers.aws.importer.ROBOT_ACCOUNT_USER_ID", "1")
+    mocker.patch("importers.aws.importer.ROBOT_ACCOUNT_USER_ID", 1)
     mocker.patch("importers.aws.importer.SQS_QUEUE_URL", "https://sqs.example/queue")
 
     mock_sqs, _ = _stub_main_dependencies(mocker)
@@ -600,7 +635,7 @@ def test_main_empty_receive_keeps_polling(importer_lib, mocker):
 
 def test_main_no_robot_user_in_db(importer_lib, mocker):
     """ROBOT_ACCOUNT_USER_ID set but no matching user row -> abort before polling."""
-    mocker.patch("importers.aws.importer.ROBOT_ACCOUNT_USER_ID", "99999")
+    mocker.patch("importers.aws.importer.ROBOT_ACCOUNT_USER_ID", 99999)
     mocker.patch("importers.aws.importer.SQS_QUEUE_URL", "https://sqs.example/queue")
 
     mock_boto = mocker.patch("importers.aws.importer.boto3.client")

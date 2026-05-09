@@ -42,12 +42,46 @@ SQS_QUEUE_URL = os.environ.get("AWS_SQS_QUEUE_URL")
 
 # Import behavior.
 HASH_SIZE_LIMIT = 10485760  # 10MB
-ROBOT_ACCOUNT_USER_ID = os.environ.get("ROBOT_ACCOUNT_USER_ID")
+
+
+def _parse_positive_int_env(name: str, raw: str | None) -> int | None:
+    """Parse ``raw`` as a positive integer, or return ``None`` if unset/blank.
+
+    Args:
+        name: The environment variable name (for error messages).
+        raw: The raw env-var value (typically ``os.environ.get(name)``).
+
+    Returns:
+        The parsed positive integer, or ``None`` if ``raw`` is ``None`` or
+        empty.
+
+    Raises:
+        ValueError: If ``raw`` is non-empty but not a positive integer.
+    """
+    if raw is None or raw == "":
+        return None
+    try:
+        value = int(raw)
+    except ValueError as e:
+        raise ValueError(f"{name} must be a positive integer, got {raw!r}") from e
+    if value <= 0:
+        raise ValueError(f"{name} must be a positive integer, got {value}")
+    return value
+
+
+# Resolved at import time so misconfiguration fails loudly at startup rather
+# than per-message. ROBOT_ACCOUNT_USER_ID is required; main() enforces that.
+ROBOT_ACCOUNT_USER_ID: int | None = _parse_positive_int_env(
+    "ROBOT_ACCOUNT_USER_ID", os.environ.get("ROBOT_ACCOUNT_USER_ID")
+)
 
 # Optional workflow auto-run: after each successful file import, create and
 # run a workflow against the imported file using the configured template.
-# Leave AWS_IMPORT_TEMPLATE_ID unset to disable (importer just ingests files).
-AWS_IMPORT_TEMPLATE_ID = os.environ.get("AWS_IMPORT_TEMPLATE_ID")
+# Leave AWS_IMPORT_TEMPLATE_ID unset (or empty) to disable — the importer
+# will just ingest files.
+AWS_IMPORT_TEMPLATE_ID: int | None = _parse_positive_int_env(
+    "AWS_IMPORT_TEMPLATE_ID", os.environ.get("AWS_IMPORT_TEMPLATE_ID")
+)
 AWS_IMPORT_TEMPLATE_PARAMS_RAW = os.environ.get("AWS_IMPORT_TEMPLATE_PARAMS", "")
 
 # SQS polling tunables.
@@ -69,7 +103,7 @@ def _parse_template_params(raw: str) -> Dict[str, Any]:
     try:
         parsed = json.loads(raw)
     except json.JSONDecodeError as e:
-        raise ValueError(f"AWS_IMPORT_TEMPLATE_PARAMS is not valid JSON: {e}")
+        raise ValueError(f"AWS_IMPORT_TEMPLATE_PARAMS is not valid JSON: {e}") from e
     if not isinstance(parsed, dict):
         raise ValueError("AWS_IMPORT_TEMPLATE_PARAMS must decode to a JSON object.")
     return parsed
@@ -173,8 +207,8 @@ def process_s3_record(
 
     try:
         download_file_from_s3(s3_client, bucket_name, object_key, output_path)
-    except Exception as e:  # boto3 raises many client-specific exceptions.
-        logger.error(f"Error downloading file from S3: {e}")
+    except Exception:  # boto3 raises many client-specific exceptions.
+        logger.exception("Error downloading s3://%s/%s", bucket_name, object_key)
         return
 
     new_file_db = create_file_record(
@@ -195,7 +229,7 @@ def process_s3_record(
     # imported file. Failures here must not bubble up: the file is already
     # on disk and in the DB, so the user can re-run manually via the UI.
     workflow_auto_run_ok = True
-    if AWS_IMPORT_TEMPLATE_ID:
+    if AWS_IMPORT_TEMPLATE_ID is not None:
         try:
             _run_template_workflow(
                 db,
@@ -206,11 +240,14 @@ def process_s3_record(
             )
         except TemplateNotFoundError as e:
             logger.error(
-                f"Workflow template {AWS_IMPORT_TEMPLATE_ID} not found for file {new_file_db.id}: {e}"
+                "Workflow template %s not found for file %s: %s",
+                AWS_IMPORT_TEMPLATE_ID,
+                new_file_db.id,
+                e,
             )
             workflow_auto_run_ok = False
-        except Exception as e:
-            logger.exception(f"Workflow auto-run failed for file {new_file_db.id}: {e}")
+        except Exception:
+            logger.exception("Workflow auto-run failed for file %s", new_file_db.id)
             workflow_auto_run_ok = False
 
     if workflow_auto_run_ok:
@@ -244,7 +281,7 @@ def _run_template_workflow(
         db,
         folder_id=folder_id,
         file_ids=[file_id],
-        template_id=int(AWS_IMPORT_TEMPLATE_ID),
+        template_id=AWS_IMPORT_TEMPLATE_ID,
         template_params=AWS_IMPORT_TEMPLATE_PARAMS,
         user=user,
         display_name=display_name,
@@ -318,7 +355,7 @@ def main() -> None:
     that transient failures result in redelivery (subject to the queue's
     redrive policy).
     """
-    if not ROBOT_ACCOUNT_USER_ID:
+    if ROBOT_ACCOUNT_USER_ID is None:
         logger.error("ROBOT_ACCOUNT_USER_ID environment variable is not set.")
         return
     if not SQS_QUEUE_URL:
@@ -328,7 +365,7 @@ def main() -> None:
     # Resolve the robot user once at startup. Bail loudly if it's missing so
     # misconfiguration is obvious instead of silently tanking every message.
     with database.SessionLocal() as db:
-        robot_user = get_user_from_db(db, int(ROBOT_ACCOUNT_USER_ID))
+        robot_user = get_user_from_db(db, ROBOT_ACCOUNT_USER_ID)
     if robot_user is None:
         logger.error(
             f"ROBOT_ACCOUNT_USER_ID={ROBOT_ACCOUNT_USER_ID!r} does not match "
@@ -341,7 +378,7 @@ def main() -> None:
 
     template_note = (
         f" Workflow auto-run enabled (template_id={AWS_IMPORT_TEMPLATE_ID})."
-        if AWS_IMPORT_TEMPLATE_ID
+        if AWS_IMPORT_TEMPLATE_ID is not None
         else " Workflow auto-run disabled."
     )
     logger.info(f"Starting to poll SQS queue {SQS_QUEUE_URL}.{template_note}")
