@@ -168,6 +168,17 @@ def process_s3_record(
 ) -> None:
     """Processes a single S3 event record from an SQS message.
 
+    Known issue (tracked separately): SQS guarantees at-least-once delivery,
+    but this function has no dedup signal. If an SQS message is redelivered
+    (worker crash between ingest and ``delete_message``, transient errors,
+    visibility-timeout expiry), the same S3 object will be imported twice,
+    producing duplicate ``File`` rows and duplicate workflow auto-runs.
+    The intended fix is an importer-scoped ``importer_event`` table keyed
+    on ``(source, event_id)`` where ``event_id = s3://{bucket}/{key}@{eventTime}``;
+    a unique constraint there makes redelivery idempotent without imposing
+    any dedup constraint on the shared ``File`` model (which must remain
+    duplicate-friendly for manual UI uploads).
+
     Args:
         s3_client: A boto3 S3 client.
         record: The S3 event record.
