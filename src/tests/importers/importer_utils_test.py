@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import json
 import uuid
 
 import pytest
@@ -19,7 +20,55 @@ from importers.importer_utils import (
     create_file_record,
     extract_file_info,
     get_or_create_root_folder,
+    parse_positive_int_env,
+    parse_template_params,
 )
+
+
+def test_parse_template_params_empty_returns_empty_dict():
+    assert parse_template_params("") == {}
+
+
+def test_parse_template_params_valid_object():
+    assert parse_template_params('{"param_1": "value"}') == {"param_1": "value"}
+
+
+@pytest.mark.parametrize("bad_raw", ["not-json", "[1, 2, 3]", '"scalar"'])
+def test_parse_template_params_rejects_bad_values(bad_raw):
+    with pytest.raises(ValueError):
+        parse_template_params(bad_raw)
+
+
+def test_parse_template_params_json_error_preserves_cause():
+    """ValueError must chain from JSONDecodeError for debuggability."""
+    with pytest.raises(ValueError) as excinfo:
+        parse_template_params("not-json")
+    assert isinstance(excinfo.value.__cause__, json.JSONDecodeError)
+
+
+@pytest.mark.parametrize("raw", [None, ""])
+def test_parse_positive_int_env_none_or_empty_returns_none(raw):
+    """Unset or empty env is the canonical "disabled" signal and must not raise."""
+    assert parse_positive_int_env("MY_VAR", raw) is None
+
+
+@pytest.mark.parametrize("raw,expected", [("1", 1), ("42", 42), ("99999", 99999)])
+def test_parse_positive_int_env_valid(raw, expected):
+    assert parse_positive_int_env("MY_VAR", raw) == expected
+
+
+@pytest.mark.parametrize("raw", ["abc", "1.5", " ", "1 2", "0x1"])
+def test_parse_positive_int_env_rejects_non_integers(raw):
+    """Non-integer values must fail fast at startup, not per-message."""
+    with pytest.raises(ValueError, match="MY_VAR"):
+        parse_positive_int_env("MY_VAR", raw)
+
+
+@pytest.mark.parametrize("raw", ["0", "-1", "-99"])
+def test_parse_positive_int_env_rejects_non_positive(raw):
+    """0 and negatives are invalid; positive-only is part of the contract."""
+    with pytest.raises(ValueError, match="MY_VAR"):
+        parse_positive_int_env("MY_VAR", raw)
 
 
 def test_extract_file_info():
@@ -79,9 +128,7 @@ def test_get_or_create_root_folder_returns_existing(mocker):
     mock_db = mocker.MagicMock()
     mock_owner = mocker.MagicMock()
     mock_owner.id = 1
-    mocker.patch(
-        "importers.importer_utils.get_user_from_db", return_value=mock_owner
-    )
+    mocker.patch("importers.importer_utils.get_user_from_db", return_value=mock_owner)
     existing_folder = mocker.MagicMock(name="existing_folder")
     # .query(Folder).join(...).filter(...).first() returns the folder.
     mock_db.query.return_value.join.return_value.filter.return_value.first.return_value = (
@@ -100,9 +147,7 @@ def test_get_or_create_root_folder_creates_when_missing(mocker):
     mock_db = mocker.MagicMock()
     mock_owner = mocker.MagicMock()
     mock_owner.id = 1
-    mocker.patch(
-        "importers.importer_utils.get_user_from_db", return_value=mock_owner
-    )
+    mocker.patch("importers.importer_utils.get_user_from_db", return_value=mock_owner)
     mock_db.query.return_value.join.return_value.filter.return_value.first.return_value = (
         None
     )

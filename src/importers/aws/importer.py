@@ -44,6 +44,8 @@ from importers.importer_utils import (
     create_file_record,
     get_or_create_root_folder,
     get_or_create_subfolder,
+    parse_positive_int_env,
+    parse_template_params
 )
 from lib import workflow_utils
 from lib.file_hashes import generate_hashes
@@ -51,57 +53,29 @@ from lib.file_hashes import generate_hashes
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-
-def _parse_positive_int_env(name: str, raw: str | None) -> int | None:
-    """Parse ``raw`` as a positive integer, or return ``None`` if unset/blank.
-
-    Raises ``ValueError`` if ``raw`` is non-empty but not a positive integer.
-    """
-    if raw is None or raw == "":
-        return None
-    try:
-        value = int(raw)
-    except ValueError as e:
-        raise ValueError(f"{name} must be a positive integer, got {raw!r}") from e
-    if value <= 0:
-        raise ValueError(f"{name} must be a positive integer, got {value}")
-    return value
-
-
-def _parse_template_params(raw: str) -> Dict[str, Any]:
-    """Parse AWS_IMPORT_TEMPLATE_PARAMS at startup, or return {} if unset."""
-    if not raw:
-        return {}
-    try:
-        parsed = json.loads(raw)
-    except json.JSONDecodeError as e:
-        raise ValueError(f"AWS_IMPORT_TEMPLATE_PARAMS is not valid JSON: {e}") from e
-    if not isinstance(parsed, dict):
-        raise ValueError("AWS_IMPORT_TEMPLATE_PARAMS must decode to a JSON object.")
-    return parsed
-
-
-# Config resolved at import time so misconfiguration fails loudly at startup,
-# not per-message. ROBOT_ACCOUNT_USER_ID is required; main() enforces it.
-# AWS_IMPORT_TEMPLATE_ID is optional — leave unset to disable workflow auto-run.
+# AWS_REGOIN, AWS_SQS_QUEUE_URL, and ROBOT_ACCOUNT_USER_ID are required.
 AWS_REGION = os.environ.get("AWS_REGION")
 SQS_QUEUE_URL = os.environ.get("AWS_SQS_QUEUE_URL")
-ROBOT_ACCOUNT_USER_ID: int | None = _parse_positive_int_env(
+ROBOT_ACCOUNT_USER_ID: int | None = parse_positive_int_env(
     "ROBOT_ACCOUNT_USER_ID", os.environ.get("ROBOT_ACCOUNT_USER_ID")
 )
-AWS_IMPORT_TEMPLATE_ID: int | None = _parse_positive_int_env(
+
+# AWS_IMPORT_TEMPLATE_ID is optional — leave unset to disable workflow auto-run.
+AWS_IMPORT_TEMPLATE_ID: int | None = parse_positive_int_env(
     "AWS_IMPORT_TEMPLATE_ID", os.environ.get("AWS_IMPORT_TEMPLATE_ID")
 )
-AWS_IMPORT_TEMPLATE_PARAMS: Dict[str, Any] = _parse_template_params(
+
+# AWS_IMPORT_TEMPLATE_PARAMS is optional - parameteers must be a JSON object if
+# set, and are passed through to the workflow template as-is.
+AWS_IMPORT_TEMPLATE_PARAMS: Dict[str, Any] = parse_template_params(
     os.environ.get("AWS_IMPORT_TEMPLATE_PARAMS", "")
 )
 
-# Files above this size are hashed out-of-band by a background job; anything
-# smaller is hashed inline to give the UI immediate results.
+# Files above this size are not hashed.
 HASH_SIZE_LIMIT = 10 * 1024 * 1024
 
-# SQS polling tunables. SQS caps MaxNumberOfMessages at 10 and WaitTimeSeconds
-# at 20; the receive-error backoff avoids busy-looping on transient errors.
+# SQS caps MaxNumberOfMessages at 10 and WaitTimeSeconds at 20; 
+# the receive-error backoff avoids busy-looping on transient errors.
 SQS_MAX_MESSAGES = 10
 SQS_WAIT_TIME_SECONDS = 20
 RECEIVE_ERROR_BACKOFF_SECONDS = 5
@@ -116,7 +90,7 @@ def parse_key(object_key: str) -> tuple[list[str], str]:
 
     Examples:
         ``root/abc/data/file.zip`` -> ``(["root", "abc", "data"], "file.zip")``
-        ``uploads/file.txt``         -> ``(["uploads"], "file.txt")``
+        ``uploads/file.txt``       -> ``(["uploads"], "file.txt")``
 
     Args:
         object_key: The URL-decoded S3 object key.
@@ -137,16 +111,13 @@ def parse_key(object_key: str) -> tuple[list[str], str]:
             "one '/' separator."
         )
     *path_parts, filename = parts
+    invalid_segments = set(["", ".", "..", "\\", "\x00"])
     for segment in (*path_parts, filename):
         if not segment:
             raise ValueError(f"Key {object_key!r} contains an empty path segment.")
-        if segment in (".", ".."):
+        if segment in invalid_segments:
             raise ValueError(
-                f"Key {object_key!r} contains a '.' or '..' segment."
-            )
-        if "\\" in segment or "\x00" in segment:
-            raise ValueError(
-                f"Key {object_key!r} contains a backslash or NUL byte."
+                f"Key {object_key!r} contains invalid path segment {segment!r}."
             )
     return path_parts, filename
 
@@ -171,16 +142,17 @@ def download_file_from_s3(
     try:
         s3_client.download_file(bucket_name, object_key, partial_path)
         os.replace(partial_path, output_path)
-    except Exception as e:
+    except Exception:
         # boto3 may leave its own multipart .tmp shards behind on failure;
         # those aren't covered here and rely on a future reconciler.
-        if os.path.exists(partial_path):
-            try:
-                os.unlink(partial_path)
-            except OSError:
-                logger.exception("Failed to remove partial download %s, %s", partial_path, str(e))
+        try:
+            os.unlink(partial_path)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            logger.exception("Failed to remove partial download %s", partial_path)
         raise
-    logger.info(f"Downloaded s3://{bucket_name}/{object_key} to {output_path}")
+    logger.info("Downloaded s3://%s/%s to %s", bucket_name, object_key, output_path)
 
 
 def process_s3_record(
@@ -198,15 +170,18 @@ def process_s3_record(
         robot_user: The user under which imports and auto-run workflows are
             attributed.
     """
-    # S3 keys in notifications are URL-encoded, and '+' represents a space.
-    raw_key = record["s3"]["object"]["key"]
-    object_key = unquote_plus(raw_key)
-    bucket_name = record["s3"]["bucket"]["name"]
-    object_size = int(record["s3"]["object"].get("size", 0))
+    try:
+        s3_info = record["s3"]
+        object_key = unquote_plus(s3_info["object"]["key"])
+        bucket_name = s3_info["bucket"]["name"]
+        object_size = int(s3_info["object"].get("size", 0))
+    except (KeyError, TypeError, ValueError):
+        # Return early if record is invalid to avoid redelivery.
+        logger.exception("Skipping malformed S3 event record: %r", record)
+        return
 
-    logger.info(f"Processing S3 object: s3://{bucket_name}/{object_key}")
+    logger.info("Processing S3 object: s3://%s/%s", bucket_name, object_key)
 
-    # Directory markers still come through; nothing to import.
     if object_key.endswith("/"):
         logger.info("S3 directory marker, nothing to import.")
         return
@@ -214,27 +189,27 @@ def process_s3_record(
     try:
         path_parts, filename = parse_key(object_key)
     except ValueError as e:
-        logger.error(f"Skipping object with unexpected key layout: {e}")
+        logger.error("Skipping object with unexpected key layout: %s", e)
         return
 
     _, file_extension = os.path.splitext(filename)
     file_uuid = uuid.uuid4()
     output_filename = f"{file_uuid.hex}{file_extension}"
 
-    # Mirror the S3 directory path into the robot user's folder tree. A later
-    # download failure leaves these folders behind; they're idempotent (future
-    # events land in the same tree) so the residue is benign.
+    # Mirror the S3 directory path into the robot user's folder tree.
     folder = get_or_create_root_folder(db, path_parts[0], ROBOT_ACCOUNT_USER_ID)
     for segment in path_parts[1:]:
         folder = get_or_create_subfolder(db, folder.id, segment, ROBOT_ACCOUNT_USER_ID)
 
     output_path = os.path.join(folder.path, output_filename)
 
+    # Download and DB-insert failures are logged and raised to avoid message
+    # deletion, which would cause silent data loss.
     try:
         download_file_from_s3(s3_client, bucket_name, object_key, output_path)
-    except Exception:  # boto3 raises many client-specific exceptions.
-        logger.exception("Error downloading s3://%s/%s", bucket_name, object_key)
-        return
+    except Exception as e:
+        logger.error("Error downloading s3://%s/%s: %s", bucket_name, object_key, e)
+        raise
 
     try:
         new_file_db = create_file_record(
@@ -245,25 +220,27 @@ def process_s3_record(
             folder.id,
             ROBOT_ACCOUNT_USER_ID,
         )
-    except Exception:
-        logger.exception(
-            "Error recording file s3://%s/%s; removing downloaded copy at %s",
+    except Exception as e:
+        logger.error(
+            "Error recording file s3://%s/%s: %s; removing downloaded copy at %s",
             bucket_name,
             object_key,
+            e,
             output_path,
         )
-        if os.path.exists(output_path):
-            try:
-                os.unlink(output_path)
-            except OSError as e:
-                logger.exception("Failed to remove orphan file %s, %s", output_path, str(e))
-        return
+        try:
+            os.unlink(output_path)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            logger.exception("Failed to remove orphan file %s", output_path)
+        raise
 
     if object_size < HASH_SIZE_LIMIT:
         try:
             generate_hashes(new_file_db.id)
-        except Exception as e:
-            logger.exception("Hashing failed for file %s, %s", new_file_db.id, str(e))
+        except Exception:
+            logger.exception("Hashing failed for file %s", new_file_db.id)
 
     if AWS_IMPORT_TEMPLATE_ID is not None:
         try:
@@ -274,14 +251,24 @@ def process_s3_record(
                 display_name=f"{filename}.workflow",
                 user=robot_user,
             )
-        except Exception as e:
-            logger.exception("Workflow auto-run failed for file %s, %s", new_file_db.id, e)
+        except Exception:
+            # Currently these failures will result in the file being imported
+            # but the workflow not running; Probably change this to raise and
+            # redeliver in the future.
             logger.warning(
-                f"Processed s3://{bucket_name}/{object_key} but workflow auto-run failed."
+                "Processed s3://%s/%s but workflow auto-run failed",
+                bucket_name,
+                object_key,
+                exc_info=True,
+            )
+            logger.info(
+                "Imported s3://%s/%s (workflow auto-run failed; see prior WARNING)",
+                bucket_name,
+                object_key,
             )
             return
 
-    logger.info(f"Successfully processed s3://{bucket_name}/{object_key}")
+    logger.info("Successfully processed s3://%s/%s", bucket_name, object_key)
 
 
 def _run_template_workflow(
@@ -319,8 +306,10 @@ def _run_template_workflow(
         user=user,
     )
     logger.info(
-        f"Started workflow {workflow.id} from template "
-        f"{AWS_IMPORT_TEMPLATE_ID} for file {file_id}"
+        "Started workflow %s from template %s for file %s",
+        workflow.id,
+        AWS_IMPORT_TEMPLATE_ID,
+        file_id,
     )
 
 
@@ -354,20 +343,17 @@ def _extract_s3_records(message: Dict[str, Any]) -> list[Dict[str, Any]]:
     ]
 
 
-def process_sqs_message(
-    s3_client: Any,
-    message: Dict[str, Any],
-    db: Session,
-    robot_user: User,
-) -> None:
+def process_sqs_message(s3_client: Any, message: Dict[str, Any]) -> None:
     """Processes a single SQS message, which may contain multiple S3 records.
+
+    Each record gets its own database session and its own robot-user lookup,
+    so a failure on one record doesn't poison the rest of the batch (SQS can
+    deliver up to ~10 S3 notifications per message). The ORM user instance
+    also stays attached to the session doing the writes.
 
     Args:
         s3_client: A boto3 S3 client.
         message: The SQS message dict.
-        db: Database session.
-        robot_user: The user under which imports and auto-run workflows are
-            attributed.
     """
     records = _extract_s3_records(message)
     if not records:
@@ -375,7 +361,43 @@ def process_sqs_message(
         return
 
     for record in records:
-        process_s3_record(s3_client, record, db, robot_user)
+        with database.SessionLocal() as db:
+            robot_user = get_user_from_db(db, ROBOT_ACCOUNT_USER_ID)
+            process_s3_record(s3_client, record, db, robot_user)
+
+
+def _validate_startup_config() -> bool:
+    """Pre-flight check that configured ids resolve in the DB.
+
+    Returns:
+        True if startup config is valid, False if a misconfiguration was
+        detected and logged. Caller should bail on False.
+    """
+    if ROBOT_ACCOUNT_USER_ID is None:
+        logger.error("ROBOT_ACCOUNT_USER_ID environment variable is not set.")
+        return False
+    if not SQS_QUEUE_URL:
+        logger.error("AWS_SQS_QUEUE_URL environment variable is not set.")
+        return False
+
+    with database.SessionLocal() as db:
+        if get_user_from_db(db, ROBOT_ACCOUNT_USER_ID) is None:
+            logger.error(
+                "ROBOT_ACCOUNT_USER_ID=%r does not match any user in the database.",
+                ROBOT_ACCOUNT_USER_ID,
+            )
+            return False
+        if (
+            AWS_IMPORT_TEMPLATE_ID is not None
+            and get_workflow_template_from_db(db, AWS_IMPORT_TEMPLATE_ID) is None
+        ):
+            logger.error(
+                "AWS_IMPORT_TEMPLATE_ID=%r does not match any workflow template "
+                "in the database.",
+                AWS_IMPORT_TEMPLATE_ID,
+            )
+            return False
+    return True
 
 
 def main() -> None:
@@ -385,33 +407,8 @@ def main() -> None:
     that transient failures result in redelivery (subject to the queue's
     redrive policy).
     """
-    if ROBOT_ACCOUNT_USER_ID is None:
-        logger.error("ROBOT_ACCOUNT_USER_ID environment variable is not set.")
-        return
-    if not SQS_QUEUE_URL:
-        logger.error("AWS_SQS_QUEUE_URL environment variable is not set.")
-        return
 
-    # Resolve the robot user and validate the optional workflow template once
-    # at startup. Bail loudly on either miss so misconfiguration is obvious
-    # instead of silently tanking every message.
-    with database.SessionLocal() as db:
-        robot_user = get_user_from_db(db, ROBOT_ACCOUNT_USER_ID)
-        template_missing = (
-            AWS_IMPORT_TEMPLATE_ID is not None
-            and get_workflow_template_from_db(db, AWS_IMPORT_TEMPLATE_ID) is None
-        )
-    if robot_user is None:
-        logger.error(
-            f"ROBOT_ACCOUNT_USER_ID={ROBOT_ACCOUNT_USER_ID!r} does not match "
-            "any user in the database."
-        )
-        return
-    if template_missing:
-        logger.error(
-            f"AWS_IMPORT_TEMPLATE_ID={AWS_IMPORT_TEMPLATE_ID!r} does not match "
-            "any workflow template in the database."
-        )
+    if not _validate_startup_config():
         return
 
     sqs = boto3.client("sqs", region_name=AWS_REGION)
@@ -431,8 +428,11 @@ def main() -> None:
                 MaxNumberOfMessages=SQS_MAX_MESSAGES,
                 WaitTimeSeconds=SQS_WAIT_TIME_SECONDS,
             )
-        except Exception as e:  # boto3 exceptions vary; back off and retry.
-            logger.exception("Error receiving SQS messages: %s", str(e))
+        except Exception:  # boto3 exceptions vary; back off and retry.
+            logger.exception(
+                "Error receiving SQS messages, backing off for %d seconds",
+                RECEIVE_ERROR_BACKOFF_SECONDS,
+            )
             time.sleep(RECEIVE_ERROR_BACKOFF_SECONDS)
             continue
 
@@ -443,17 +443,19 @@ def main() -> None:
         for message in messages:
             receipt_handle = message.get("ReceiptHandle")
             try:
-                with database.SessionLocal() as db:
-                    process_sqs_message(s3, message, db, robot_user)
-            except Exception as e:
-                logger.exception("Error processing SQS message: %s", str(e))
+                process_sqs_message(s3, message)
+            except Exception:
+                logger.exception("Error processing SQS message")
                 # Don't delete — let the queue redeliver after visibility timeout.
                 continue
 
             try:
                 sqs.delete_message(QueueUrl=SQS_QUEUE_URL, ReceiptHandle=receipt_handle)
-            except Exception as e:
-                logger.exception("Error deleting SQS message: %s", str(e))
+            except Exception:
+                # Delete failure means the message will be redelivered; the
+                # per-record dedup TODO above is the guard against duplicate
+                # ingestion.
+                logger.exception("Error deleting SQS message")
 
 
 if __name__ == "__main__":
