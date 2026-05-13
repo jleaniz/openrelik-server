@@ -13,9 +13,10 @@
 # limitations under the License.
 """Shared helpers for cloud-object-store importers (GCS, S3)."""
 
+import json
 import os
 import uuid
-from typing import Tuple
+from typing import Any, Dict, Tuple
 
 from sqlalchemy.orm import Session
 
@@ -27,6 +28,47 @@ from datastores.sql.models import file
 from datastores.sql.models.folder import Folder
 from datastores.sql.models.role import Role
 from datastores.sql.models.user import UserRole
+
+
+def parse_template_params(raw: str) -> Dict[str, Any]:
+    """Parse workflow template parameters or return {} if unset."""
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Parameters are not valid JSON: {e}") from e
+    if not isinstance(parsed, dict):
+        raise ValueError("Parameters must decode to a JSON object.")
+    return parsed
+
+def parse_positive_int_env(name: str, raw: str | None) -> int | None:
+    """Parse ``raw`` as a positive integer, or return ``None`` if unset/blank.
+
+    Intended for importer-module-level env-var parsing: failing at import
+    time makes misconfiguration loud, rather than silently coercing at DB
+    query time or crashing per-message.
+
+    Args:
+        name: The environment variable name (for error messages).
+        raw: The raw env-var value (typically ``os.environ.get(name)``).
+
+    Returns:
+        The parsed positive integer, or ``None`` if ``raw`` is ``None`` or
+        empty.
+
+    Raises:
+        ValueError: If ``raw`` is non-empty but not a positive integer.
+    """
+    if raw is None or raw == "":
+        return None
+    try:
+        value = int(raw)
+    except ValueError as e:
+        raise ValueError(f"{name} must be a positive integer, got {raw!r}") from e
+    if value <= 0:
+        raise ValueError(f"{name} must be a positive integer, got {value}")
+    return value
 
 
 def extract_file_info(object_name: str) -> Tuple[int, str, str, str]:
@@ -60,9 +102,7 @@ def extract_file_info(object_name: str) -> Tuple[int, str, str, str]:
     return folder_id, filename, file_extension, output_filename
 
 
-def get_or_create_root_folder(
-    db: Session, display_name: str, user_id: int
-) -> Folder:
+def get_or_create_root_folder(db: Session, display_name: str, user_id: int) -> Folder:
     """Return the robot user's root folder with ``display_name``, creating it if missing.
 
     Matches on (display_name, parent_id IS NULL, owner=user_id) so importers

@@ -27,7 +27,6 @@ def importer_lib(mocker):
     mocker.patch.dict("sys.modules", {"boto3": mocker.MagicMock()})
 
     from importers.aws.importer import (
-        _parse_template_params,
         download_file_from_s3,
         main,
         parse_key,
@@ -36,7 +35,6 @@ def importer_lib(mocker):
     )
 
     return {
-        "_parse_template_params": _parse_template_params,
         "download_file_from_s3": download_file_from_s3,
         "main": main,
         "parse_key": parse_key,
@@ -72,26 +70,11 @@ def _make_sqs_message(records, receipt_handle="rh-1", sns_wrapped=False):
     return {"Body": json.dumps(body), "ReceiptHandle": receipt_handle}
 
 
-def test_parse_template_params_empty_returns_empty_dict(importer_lib):
-    assert importer_lib["_parse_template_params"]("") == {}
-
-
-def test_parse_template_params_valid_object(importer_lib):
-    assert importer_lib["_parse_template_params"]('{"param_1": "value"}') == {
-        "param_1": "value"
-    }
-
-
-@pytest.mark.parametrize("bad_raw", ["not-json", "[1, 2, 3]", '"scalar"'])
-def test_parse_template_params_rejects_bad_values(importer_lib, bad_raw):
-    with pytest.raises(ValueError):
-        importer_lib["_parse_template_params"](bad_raw)
-
-
 def test_parse_key_valid(importer_lib):
-    assert importer_lib["parse_key"](
-        "test/mytestCase/folder/filename.zip"
-    ) == (["test", "mytestCase", "folder"], "filename.zip")
+    assert importer_lib["parse_key"]("test/mytestCase/folder/filename.zip") == (
+        ["test", "mytestCase", "folder"],
+        "filename.zip",
+    )
 
 
 def test_parse_key_single_segment(importer_lib):
@@ -113,14 +96,53 @@ def test_parse_key_rejects_empty_segment(importer_lib):
         importer_lib["parse_key"]("users//data/file.txt")
 
 
+@pytest.mark.parametrize(
+    "bad_key",
+    [
+        "users/../file.txt",
+        "users/./file.txt",
+        "users/case1/..",
+        "users/case1/.",
+        "users/\\/file.txt",
+        "users/case1/\\",
+        "users/\x00/file.txt",
+        "users/case1/\x00",
+    ],
+)
+def test_parse_key_rejects_unsafe_segments(importer_lib, bad_key):
+    """'.', '..', backslash, and NUL are rejected when they are a whole path segment."""
+    with pytest.raises(ValueError):
+        importer_lib["parse_key"](bad_key)
+
+
 def test_download_file_from_s3(importer_lib, mocker):
+    """Successful download writes to .partial then os.replace()s into place."""
     mock_s3 = mocker.MagicMock()
+    mock_replace = mocker.patch("importers.aws.importer.os.replace")
+
     importer_lib["download_file_from_s3"](
         mock_s3, "my-bucket", "my-object", "/path/to/output"
     )
+
     mock_s3.download_file.assert_called_once_with(
-        "my-bucket", "my-object", "/path/to/output"
+        "my-bucket", "my-object", "/path/to/output.partial"
     )
+    mock_replace.assert_called_once_with("/path/to/output.partial", "/path/to/output")
+
+
+def test_download_file_from_s3_cleans_up_partial_on_failure(importer_lib, mocker):
+    """On download failure, the .partial file is unlinked and the error re-raises."""
+    mock_s3 = mocker.MagicMock()
+    mock_s3.download_file.side_effect = Exception("network flake")
+    mocker.patch("importers.aws.importer.os.path.exists", return_value=True)
+    mock_unlink = mocker.patch("importers.aws.importer.os.unlink")
+
+    with pytest.raises(Exception, match="network flake"):
+        importer_lib["download_file_from_s3"](
+            mock_s3, "my-bucket", "my-object", "/path/to/output"
+        )
+
+    mock_unlink.assert_called_once_with("/path/to/output.partial")
 
 
 def _patch_successful_dependencies(mocker, folder_path="/folder/path", folder_id=7):
@@ -205,6 +227,40 @@ def test_process_s3_record_url_encoded_key_is_decoded(importer_lib, mocker):
     assert patches["create"].call_args.args[1] == "my file name.txt"
 
 
+@pytest.mark.parametrize(
+    "record",
+    [
+        pytest.param({"eventName": "ObjectCreated:Put"}, id="missing-s3-key"),
+        pytest.param(
+            {"eventName": "ObjectCreated:Put", "s3": {"object": {"key": "a/b.txt"}}},
+            id="missing-bucket",
+        ),
+        pytest.param(
+            {
+                "eventName": "ObjectCreated:Put",
+                "s3": {
+                    "bucket": {"name": "b"},
+                    "object": {"key": "a/b.txt", "size": "huge"},
+                },
+            },
+            id="non-numeric-size",
+        ),
+    ],
+)
+def test_process_s3_record_skips_malformed_record(importer_lib, mocker, record):
+    """A malformed record must skip cleanly so SQS can delete the message."""
+    mock_get_or_create = mocker.patch(
+        "importers.aws.importer.get_or_create_root_folder"
+    )
+
+    # Must not raise — the caller relies on returning normally.
+    importer_lib["process_s3_record"](
+        mocker.MagicMock(), record, mocker.MagicMock(), _make_robot_user(mocker)
+    )
+
+    mock_get_or_create.assert_not_called()
+
+
 def test_process_s3_record_skips_directory_marker(importer_lib, mocker):
     mock_get_or_create = mocker.patch(
         "importers.aws.importer.get_or_create_root_folder"
@@ -236,10 +292,50 @@ def test_process_s3_record_skips_bad_layout(importer_lib, mocker):
     mock_get_or_create.assert_not_called()
 
 
-def test_process_s3_record_download_error_does_not_create_file(importer_lib, mocker):
+def test_process_s3_record_download_error_raises_for_redelivery(importer_lib, mocker):
+    """Download failures are often transient; re-raise so SQS redelivers the message."""
     patches = _patch_successful_dependencies(mocker)
     patches["download"].side_effect = Exception("boom")
 
+    with pytest.raises(Exception, match="boom"):
+        importer_lib["process_s3_record"](
+            mocker.MagicMock(),
+            _make_s3_record(key="users/case1/data/file.txt"),
+            mocker.MagicMock(),
+            _make_robot_user(mocker),
+        )
+
+    patches["create"].assert_not_called()
+
+
+def test_process_s3_record_create_file_error_unlinks_and_raises(importer_lib, mocker):
+    """DB insert failures unlink the download and re-raise so SQS redelivers."""
+    patches = _patch_successful_dependencies(mocker)
+    patches["create"].side_effect = Exception("db down")
+    mock_unlink = mocker.patch("importers.aws.importer.os.unlink")
+
+    with pytest.raises(Exception, match="db down"):
+        importer_lib["process_s3_record"](
+            mocker.MagicMock(),
+            _make_s3_record(key="users/case1/data/file.txt"),
+            mocker.MagicMock(),
+            _make_robot_user(mocker),
+        )
+
+    patches["download"].assert_called_once()
+    unlinked_paths = [call.args[0] for call in mock_unlink.call_args_list]
+    assert any(
+        p.endswith(".txt") for p in unlinked_paths
+    ), f"expected final file to be unlinked, got {unlinked_paths}"
+    patches["hashes"].assert_not_called()
+
+
+def test_process_s3_record_hash_error_does_not_fail_import(importer_lib, mocker):
+    """Hash failures on an already-persisted file must not bubble up and trigger SQS redelivery."""
+    patches = _patch_successful_dependencies(mocker)
+    patches["hashes"].side_effect = Exception("magic library exploded")
+
+    # Must not raise.
     importer_lib["process_s3_record"](
         mocker.MagicMock(),
         _make_s3_record(key="users/case1/data/file.txt"),
@@ -247,7 +343,9 @@ def test_process_s3_record_download_error_does_not_create_file(importer_lib, moc
         _make_robot_user(mocker),
     )
 
-    patches["create"].assert_not_called()
+    # File still imported; the hash failure was swallowed with a log.
+    patches["create"].assert_called_once()
+    patches["hashes"].assert_called_once()
 
 
 def test_process_s3_record_skips_hashing_for_large_files(importer_lib, mocker):
@@ -301,7 +399,7 @@ def test_process_s3_record_runs_workflow_when_template_id_set(importer_lib, mock
 
     from importers.aws import importer as aws_importer
 
-    mocker.patch.object(aws_importer, "AWS_IMPORT_TEMPLATE_ID", "7")
+    mocker.patch.object(aws_importer, "AWS_IMPORT_TEMPLATE_ID", 7)
     mocker.patch.object(
         aws_importer, "AWS_IMPORT_TEMPLATE_PARAMS", {"my_param_0": "value"}
     )
@@ -348,7 +446,7 @@ def test_process_s3_record_workflow_error_does_not_fail_import(importer_lib, moc
 
     from importers.aws import importer as aws_importer
 
-    mocker.patch.object(aws_importer, "AWS_IMPORT_TEMPLATE_ID", "7")
+    mocker.patch.object(aws_importer, "AWS_IMPORT_TEMPLATE_ID", 7)
     mocker.patch(
         "lib.workflow_utils.create_workflow_from_template",
         side_effect=Exception("db down"),
@@ -366,21 +464,27 @@ def test_process_s3_record_workflow_error_does_not_fail_import(importer_lib, moc
     patches["hashes"].assert_called_once()
 
 
-def test_process_s3_record_logs_template_not_found(importer_lib, mocker, caplog):
-    """A missing template id must be logged with the template id mentioned."""
-    from lib.workflow_utils import TemplateNotFoundError
+def test_process_s3_record_workflow_error_logs_at_warning_with_traceback(
+    importer_lib, mocker, caplog
+):
+    """Workflow auto-run is best-effort: the failure log must be WARNING
+    (not ERROR/.exception) and must still include the traceback, and the
+    successful-import log line must still be emitted so operators can tell
+    the file was ingested.
+    """
+    import logging
 
-    patches = _patch_successful_dependencies(mocker)
+    _patch_successful_dependencies(mocker)
 
     from importers.aws import importer as aws_importer
 
-    mocker.patch.object(aws_importer, "AWS_IMPORT_TEMPLATE_ID", "9999")
+    mocker.patch.object(aws_importer, "AWS_IMPORT_TEMPLATE_ID", 7)
     mocker.patch(
         "lib.workflow_utils.create_workflow_from_template",
-        side_effect=TemplateNotFoundError("Workflow template 9999 not found"),
+        side_effect=RuntimeError("workflow machinery exploded"),
     )
 
-    with caplog.at_level("ERROR", logger="importers.aws.importer"):
+    with caplog.at_level(logging.DEBUG, logger="importers.aws.importer"):
         importer_lib["process_s3_record"](
             mocker.MagicMock(),
             _make_s3_record(key="users/case1/data/file.txt"),
@@ -388,43 +492,62 @@ def test_process_s3_record_logs_template_not_found(importer_lib, mocker, caplog)
             _make_robot_user(mocker),
         )
 
-    # Import itself still succeeded.
-    patches["create"].assert_called_once()
-    # The TemplateNotFoundError message made it into the log.
+    # The failure is logged at WARNING, not ERROR — best-effort path.
+    warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
     assert any(
-        "Workflow template 9999 not found" in rec.message for rec in caplog.records
-    ), "expected TemplateNotFoundError message to be logged"
+        "workflow auto-run failed" in r.getMessage() for r in warning_records
+    ), f"expected a WARNING about workflow auto-run; got {caplog.records!r}"
+
+    # The traceback is attached to that WARNING record via exc_info.
+    assert any(
+        "workflow auto-run failed" in r.getMessage() and r.exc_info is not None
+        for r in warning_records
+    ), "WARNING record must carry exc_info for debuggability"
+
+    # No ERROR-level record from the workflow path — only the downstream
+    # INFO "Imported ... workflow auto-run failed" note.
+    error_records = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert (
+        error_records == []
+    ), f"workflow failure must not escalate to ERROR: {error_records!r}"
+
+    # The ingest-status log line is still emitted (INFO), so operators can
+    # distinguish "file imported, workflow missed" from "file never imported".
+    info_records = [r for r in caplog.records if r.levelno == logging.INFO]
+    assert any(
+        "Imported s3://" in r.getMessage()
+        and "workflow auto-run failed" in r.getMessage()
+        for r in info_records
+    ), "expected INFO 'Imported ... workflow auto-run failed' follow-up"
 
 
-# ---------------------------------------------------------------------------
-# process_sqs_message
-# ---------------------------------------------------------------------------
+def _stub_sqs_message_deps(mocker):
+    """Stub database.SessionLocal and get_user_from_db for process_sqs_message tests."""
+    mocker.patch("importers.aws.importer.database")
+    mocker.patch(
+        "importers.aws.importer.get_user_from_db",
+        return_value=_make_robot_user(mocker),
+    )
 
 
 def test_process_sqs_message_direct_s3_event(importer_lib, mocker):
+    _stub_sqs_message_deps(mocker)
     mock_handler = mocker.patch("importers.aws.importer.process_s3_record")
 
     record = _make_s3_record()
-    importer_lib["process_sqs_message"](
-        mocker.MagicMock(),
-        _make_sqs_message([record]),
-        mocker.MagicMock(),
-        _make_robot_user(mocker),
-    )
+    importer_lib["process_sqs_message"](mocker.MagicMock(), _make_sqs_message([record]))
 
     mock_handler.assert_called_once()
     assert mock_handler.call_args.args[1] == record
 
 
 def test_process_sqs_message_sns_wrapped(importer_lib, mocker):
+    _stub_sqs_message_deps(mocker)
     mock_handler = mocker.patch("importers.aws.importer.process_s3_record")
 
     record = _make_s3_record()
     importer_lib["process_sqs_message"](
-        mocker.MagicMock(),
-        _make_sqs_message([record], sns_wrapped=True),
-        mocker.MagicMock(),
-        _make_robot_user(mocker),
+        mocker.MagicMock(), _make_sqs_message([record], sns_wrapped=True)
     )
 
     mock_handler.assert_called_once()
@@ -433,29 +556,93 @@ def test_process_sqs_message_sns_wrapped(importer_lib, mocker):
 
 def test_process_sqs_message_no_records(importer_lib, mocker):
     """A message with no 'Records' (e.g. s3:TestEvent) must be a no-op."""
+    _stub_sqs_message_deps(mocker)
     mock_handler = mocker.patch("importers.aws.importer.process_s3_record")
 
     message = {"Body": json.dumps({"Event": "s3:TestEvent"}), "ReceiptHandle": "rh"}
-    importer_lib["process_sqs_message"](
-        mocker.MagicMock(), message, mocker.MagicMock(), _make_robot_user(mocker)
-    )
+    importer_lib["process_sqs_message"](mocker.MagicMock(), message)
 
     mock_handler.assert_not_called()
 
 
 def test_process_sqs_message_skips_non_object_created(importer_lib, mocker):
+    _stub_sqs_message_deps(mocker)
     mock_handler = mocker.patch("importers.aws.importer.process_s3_record")
     record = _make_s3_record(event_name="ObjectRemoved:Delete")
-    importer_lib["process_sqs_message"](
-        mocker.MagicMock(),
-        _make_sqs_message([record]),
-        mocker.MagicMock(),
-        _make_robot_user(mocker),
-    )
+    importer_lib["process_sqs_message"](mocker.MagicMock(), _make_sqs_message([record]))
     mock_handler.assert_not_called()
 
 
+def test_process_sqs_message_uses_per_record_session(importer_lib, mocker):
+    """Each S3 record in a batched message gets its own SessionLocal + user lookup."""
+    mock_db_module = mocker.patch("importers.aws.importer.database")
+    mock_get_user = mocker.patch(
+        "importers.aws.importer.get_user_from_db",
+        return_value=_make_robot_user(mocker),
+    )
+    mocker.patch("importers.aws.importer.process_s3_record")
+
+    records = [
+        _make_s3_record(key="users/case1/data/a.txt"),
+        _make_s3_record(key="users/case1/data/b.txt"),
+        _make_s3_record(key="users/case1/data/c.txt"),
+    ]
+    importer_lib["process_sqs_message"](mocker.MagicMock(), _make_sqs_message(records))
+
+    assert mock_db_module.SessionLocal.call_count == 3
+    assert mock_get_user.call_count == 3
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        pytest.param(
+            {"Body": "{not valid json", "ReceiptHandle": "rh"}, id="invalid-json"
+        ),
+        pytest.param(
+            {
+                "Body": json.dumps({"Message": "{still invalid"}),
+                "ReceiptHandle": "rh",
+            },
+            id="sns-wrapped-invalid-inner",
+        ),
+        pytest.param({"ReceiptHandle": "rh"}, id="missing-body-key"),
+    ],
+)
+def test_process_sqs_message_malformed_body_is_noop(importer_lib, mocker, message):
+    """Malformed bodies must drop cleanly (no handler call, no exception) so SQS can delete the message."""
+    _stub_sqs_message_deps(mocker)
+    mock_handler = mocker.patch("importers.aws.importer.process_s3_record")
+
+    # Must not raise — the caller relies on returning normally to delete the message.
+    importer_lib["process_sqs_message"](mocker.MagicMock(), message)
+
+    mock_handler.assert_not_called()
+
+
+def test_main_malformed_body_is_deleted(importer_lib, mocker):
+    """End-to-end: a malformed SQS body is deleted, not looped."""
+    mocker.patch("importers.aws.importer.ROBOT_ACCOUNT_USER_ID", 1)
+    mocker.patch("importers.aws.importer.SQS_QUEUE_URL", "https://sqs.example/queue")
+
+    mock_sqs, _ = _stub_main_dependencies(mocker)
+
+    bad_message = {"Body": "{not json", "ReceiptHandle": "rh-bad"}
+    mock_sqs.receive_message.side_effect = [
+        {"Messages": [bad_message]},
+        KeyboardInterrupt(),
+    ]
+
+    with pytest.raises(KeyboardInterrupt):
+        importer_lib["main"]()
+
+    mock_sqs.delete_message.assert_called_once_with(
+        QueueUrl="https://sqs.example/queue", ReceiptHandle="rh-bad"
+    )
+
+
 def test_process_sqs_message_multiple_records(importer_lib, mocker):
+    _stub_sqs_message_deps(mocker)
     mock_handler = mocker.patch("importers.aws.importer.process_s3_record")
 
     records = [
@@ -465,19 +652,9 @@ def test_process_sqs_message_multiple_records(importer_lib, mocker):
         ),
         _make_s3_record(key="users/case1/data/c.txt"),
     ]
-    importer_lib["process_sqs_message"](
-        mocker.MagicMock(),
-        _make_sqs_message(records),
-        mocker.MagicMock(),
-        _make_robot_user(mocker),
-    )
+    importer_lib["process_sqs_message"](mocker.MagicMock(), _make_sqs_message(records))
 
     assert mock_handler.call_count == 2
-
-
-# ---------------------------------------------------------------------------
-# main
-# ---------------------------------------------------------------------------
 
 
 def test_main_no_robot_user(importer_lib, mocker):
@@ -490,7 +667,7 @@ def test_main_no_robot_user(importer_lib, mocker):
 
 
 def test_main_no_queue_url(importer_lib, mocker):
-    mocker.patch("importers.aws.importer.ROBOT_ACCOUNT_USER_ID", "1")
+    mocker.patch("importers.aws.importer.ROBOT_ACCOUNT_USER_ID", 1)
     mocker.patch("importers.aws.importer.SQS_QUEUE_URL", None)
     mock_boto = mocker.patch("importers.aws.importer.boto3.client")
 
@@ -499,8 +676,8 @@ def test_main_no_queue_url(importer_lib, mocker):
     mock_boto.assert_not_called()
 
 
-def _stub_main_dependencies(mocker, robot_user=None):
-    """Stub boto3, database, and get_user_from_db for main() tests."""
+def _stub_main_dependencies(mocker, robot_user=None, template=None):
+    """Stub boto3, database, get_user_from_db, and the template lookup for main() tests."""
     mock_sqs = mocker.MagicMock()
     mock_s3 = mocker.MagicMock()
     mocker.patch(
@@ -512,11 +689,17 @@ def _stub_main_dependencies(mocker, robot_user=None):
         "importers.aws.importer.get_user_from_db",
         return_value=robot_user if robot_user is not None else _make_robot_user(mocker),
     )
+    # Default: pretend any template id resolves, so tests that don't care about
+    # template validation aren't forced to configure it.
+    mocker.patch(
+        "importers.aws.importer.get_workflow_template_from_db",
+        return_value=template if template is not None else mocker.MagicMock(),
+    )
     return mock_sqs, mock_s3
 
 
 def test_main_processes_message_and_deletes(importer_lib, mocker):
-    mocker.patch("importers.aws.importer.ROBOT_ACCOUNT_USER_ID", "1")
+    mocker.patch("importers.aws.importer.ROBOT_ACCOUNT_USER_ID", 1)
     mocker.patch("importers.aws.importer.SQS_QUEUE_URL", "https://sqs.example/queue")
 
     mock_sqs, _ = _stub_main_dependencies(mocker)
@@ -533,13 +716,16 @@ def test_main_processes_message_and_deletes(importer_lib, mocker):
         importer_lib["main"]()
 
     mock_process.assert_called_once()
+    # Delete MUST follow a successful process — regression from an earlier
+    # rewrite that dropped this assertion. Without it, a code change that
+    # stops calling delete_message wouldn't be caught here.
     mock_sqs.delete_message.assert_called_once_with(
         QueueUrl="https://sqs.example/queue", ReceiptHandle="rh-42"
     )
 
 
 def test_main_processing_error_does_not_delete(importer_lib, mocker):
-    mocker.patch("importers.aws.importer.ROBOT_ACCOUNT_USER_ID", "1")
+    mocker.patch("importers.aws.importer.ROBOT_ACCOUNT_USER_ID", 1)
     mocker.patch("importers.aws.importer.SQS_QUEUE_URL", "https://sqs.example/queue")
 
     mock_sqs, _ = _stub_main_dependencies(mocker)
@@ -562,7 +748,7 @@ def test_main_processing_error_does_not_delete(importer_lib, mocker):
 
 
 def test_main_receive_error_retries(importer_lib, mocker):
-    mocker.patch("importers.aws.importer.ROBOT_ACCOUNT_USER_ID", "1")
+    mocker.patch("importers.aws.importer.ROBOT_ACCOUNT_USER_ID", 1)
     mocker.patch("importers.aws.importer.SQS_QUEUE_URL", "https://sqs.example/queue")
 
     mock_sqs, _ = _stub_main_dependencies(mocker)
@@ -580,7 +766,7 @@ def test_main_receive_error_retries(importer_lib, mocker):
 
 
 def test_main_empty_receive_keeps_polling(importer_lib, mocker):
-    mocker.patch("importers.aws.importer.ROBOT_ACCOUNT_USER_ID", "1")
+    mocker.patch("importers.aws.importer.ROBOT_ACCOUNT_USER_ID", 1)
     mocker.patch("importers.aws.importer.SQS_QUEUE_URL", "https://sqs.example/queue")
 
     mock_sqs, _ = _stub_main_dependencies(mocker)
@@ -600,13 +786,58 @@ def test_main_empty_receive_keeps_polling(importer_lib, mocker):
 
 def test_main_no_robot_user_in_db(importer_lib, mocker):
     """ROBOT_ACCOUNT_USER_ID set but no matching user row -> abort before polling."""
-    mocker.patch("importers.aws.importer.ROBOT_ACCOUNT_USER_ID", "99999")
+    mocker.patch("importers.aws.importer.ROBOT_ACCOUNT_USER_ID", 99999)
     mocker.patch("importers.aws.importer.SQS_QUEUE_URL", "https://sqs.example/queue")
 
     mock_boto = mocker.patch("importers.aws.importer.boto3.client")
     mocker.patch("importers.aws.importer.database")
     mocker.patch("importers.aws.importer.get_user_from_db", return_value=None)
+    mocker.patch(
+        "importers.aws.importer.get_workflow_template_from_db",
+        return_value=mocker.MagicMock(),
+    )
 
     importer_lib["main"]()
 
     mock_boto.assert_not_called()
+
+
+def test_main_no_template_in_db(importer_lib, mocker):
+    """AWS_IMPORT_TEMPLATE_ID set but no matching template row -> abort before polling."""
+    mocker.patch("importers.aws.importer.ROBOT_ACCOUNT_USER_ID", 1)
+    mocker.patch("importers.aws.importer.SQS_QUEUE_URL", "https://sqs.example/queue")
+    mocker.patch("importers.aws.importer.AWS_IMPORT_TEMPLATE_ID", 9999)
+
+    mock_boto = mocker.patch("importers.aws.importer.boto3.client")
+    mocker.patch("importers.aws.importer.database")
+    mocker.patch(
+        "importers.aws.importer.get_user_from_db",
+        return_value=_make_robot_user(mocker),
+    )
+    mock_template_lookup = mocker.patch(
+        "importers.aws.importer.get_workflow_template_from_db",
+        return_value=None,
+    )
+
+    importer_lib["main"]()
+
+    mock_boto.assert_not_called()
+    mock_template_lookup.assert_called_once()
+
+
+def test_main_skips_template_lookup_when_disabled(importer_lib, mocker):
+    """With AWS_IMPORT_TEMPLATE_ID unset, no template DB lookup happens at startup."""
+    mocker.patch("importers.aws.importer.ROBOT_ACCOUNT_USER_ID", 1)
+    mocker.patch("importers.aws.importer.SQS_QUEUE_URL", "https://sqs.example/queue")
+    mocker.patch("importers.aws.importer.AWS_IMPORT_TEMPLATE_ID", None)
+
+    mock_sqs, _ = _stub_main_dependencies(mocker)
+    mock_template_lookup = mocker.patch(
+        "importers.aws.importer.get_workflow_template_from_db"
+    )
+    mock_sqs.receive_message.side_effect = [KeyboardInterrupt()]
+
+    with pytest.raises(KeyboardInterrupt):
+        importer_lib["main"]()
+
+    mock_template_lookup.assert_not_called()
