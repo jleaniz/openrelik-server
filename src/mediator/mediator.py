@@ -207,6 +207,11 @@ def process_task_progress_event(
     state.event(event)
     celery_task = state.tasks.get(event["uuid"])
     db_task = get_task_from_db(db, celery_task.uuid)
+    if not db_task:
+        # Task might not be in the database yet (or was dispatched outside the
+        # normal create_workflow/create_task_in_db path) -- skip processing
+        # rather than crash the mediator on every retry of this event.
+        return
     db_task.status_short = celery_task.state
     db_task.status_progress = json.dumps(event.get("data"))
     update_database(db, db_task)

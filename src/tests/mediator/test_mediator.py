@@ -170,6 +170,44 @@ def test_process_failed_task():
     assert mock_db_task.error_traceback == "Test Traceback"
 
 
+def test_process_task_progress_event_updates_known_task(monkeypatch):
+    mock_db = mock.Mock()
+    mock_state = mock.Mock()
+    mock_celery_task = mock.Mock(uuid="task-uuid", state="PROGRESS")
+    mock_state.tasks.get.return_value = mock_celery_task
+    mock_db_task = mock.Mock()
+    monkeypatch.setattr(
+        mediator, "get_task_from_db", mock.Mock(return_value=mock_db_task)
+    )
+    monkeypatch.setattr(mediator, "update_database", mock.Mock())
+
+    event = {"uuid": "task-uuid", "data": {"progress": "50%"}}
+    mediator.process_task_progress_event(mock_db, mock_state, event)
+
+    mock_state.event.assert_called_once_with(event)
+    assert mock_db_task.status_short == "PROGRESS"
+    assert mock_db_task.status_progress == json.dumps({"progress": "50%"})
+    mediator.update_database.assert_called_once_with(mock_db, mock_db_task)
+
+
+def test_process_task_progress_event_skips_unknown_task(monkeypatch):
+    """A task-progress event for a Celery task with no matching DB row (e.g.
+    one dispatched outside create_workflow/create_task_in_db) must be a no-op,
+    not an AttributeError that crashes the mediator's whole event loop."""
+    mock_db = mock.Mock()
+    mock_state = mock.Mock()
+    mock_celery_task = mock.Mock(uuid="orphan-uuid", state="PROGRESS")
+    mock_state.tasks.get.return_value = mock_celery_task
+    monkeypatch.setattr(mediator, "get_task_from_db", mock.Mock(return_value=None))
+    mock_update = mock.Mock()
+    monkeypatch.setattr(mediator, "update_database", mock_update)
+
+    event = {"uuid": "orphan-uuid", "data": {"progress": "50%"}}
+    mediator.process_task_progress_event(mock_db, mock_state, event)  # must not raise
+
+    mock_update.assert_not_called()
+
+
 def test_create_file_in_database(monkeypatch):
     mock_db = mock.Mock()
     file_data = {
